@@ -1,7 +1,7 @@
 """
 NutriLens FastAPI Backend
 Production-hardened application with non-blocking async network clients,
-ML model integration, Supabase authentication, and full API endpoints.
+ML model integration, Supabase authentication & JWT propagation, and full API endpoints.
 """
 
 import io
@@ -20,7 +20,13 @@ from supabase import Client
 
 from config import settings
 from logger import logger, RequestLoggingMiddleware
-from auth import get_current_user, get_optional_user, get_supabase_client, AuthenticatedUser
+from auth import (
+    get_current_user,
+    get_optional_user,
+    get_supabase_client,
+    get_authenticated_supabase_client,
+    AuthenticatedUser,
+)
 from schemas import (
     AnalyzeResponse,
     LogMealRequest,
@@ -34,6 +40,7 @@ from model_utils import (
     predict_food_name as predict_food_name_util,
     get_class_names,
     get_loaded_model,
+    is_model_loaded,
 )
 
 # Optional Gemini setup
@@ -76,14 +83,12 @@ async def startup_event():
     global ASYNC_HTTP_CLIENT
     logger.info(f"Starting NutriLens API in {settings.ENVIRONMENT} mode...")
 
-    # Initialize async HTTP client with pooling and timeout
     ASYNC_HTTP_CLIENT = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.HTTP_TIMEOUT_SECONDS),
         follow_redirects=True,
         limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
     )
 
-    # Safely load or retrieve ML model
     try:
         load_model_safe(settings.MODEL_PATH, settings.MODEL_DOWNLOAD_URL)
     except Exception as exc:
@@ -122,8 +127,7 @@ def preprocess_image(image_bytes: bytes) -> np.ndarray:
         )
     try:
         image = Image.open(io.BytesIO(image_bytes))
-        image.verify()  # Verify integrity
-        # Reopen after verify
+        image.verify()
         image = Image.open(io.BytesIO(image_bytes))
         if image.mode != "RGB":
             image = image.convert("RGB")
@@ -259,10 +263,9 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint reflecting service configuration."""
-    model = get_loaded_model()
     return {
         "status": "healthy",
-        "model_loaded": model is not None,
+        "model_loaded": is_model_loaded(),
         "supabase_configured": bool(settings.SUPABASE_URL and settings.SUPABASE_KEY),
         "usda_configured": bool(settings.USDA_API_KEY),
         "gemini_configured": bool(settings.GEMINI_API_KEY),
@@ -277,12 +280,13 @@ async def analyze_food_image(
 ):
     """
     Analyze uploaded food image with ML model and USDA nutrition data.
+    If no trained model is available on disk, explicitly returns 503 Service Unavailable.
     """
     model = get_loaded_model()
     if model is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="ML inference model is currently unavailable"
+            detail="Trained ML model is currently unavailable on the server. Please ensure 'food_model.h5' is placed in ./models/ or configure MODEL_DOWNLOAD_URL."
         )
 
     try:
@@ -312,11 +316,11 @@ async def analyze_food_image(
 async def log_meal(
     meal_data: LogMealRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
-    supabase: Client = Depends(get_supabase_client)
+    supabase: Client = Depends(get_authenticated_supabase_client)
 ):
     """
     Securely log a meal for the authenticated user.
-    Prevents IDOR: user_id is always taken from authenticated credentials.
+    Propagates user JWT to Supabase so PostgreSQL auth.uid() matches and RLS applies.
     """
     target_user_id = current_user.user_id
     try:
@@ -347,11 +351,12 @@ async def log_meal(
 async def get_history(
     user_id: str,
     current_user: AuthenticatedUser = Depends(get_current_user),
-    supabase: Client = Depends(get_supabase_client)
+    supabase: Client = Depends(get_authenticated_supabase_client)
 ):
     """
     Fetch history for user.
     IDOR Protection: Users can only read their own meal history.
+    Propagates user JWT so RLS verifies auth.uid().
     """
     if current_user.user_id != user_id:
         logger.warning(f"IDOR attempt blocked: User {current_user.user_id} tried to read history of {user_id}")
@@ -379,6 +384,7 @@ async def get_community_feed(
 ):
     """
     Public community feed: returns latest 20 public meals.
+    Uses unauthenticated client (public meals have is_public=true allowed by RLS).
     """
     try:
         response = supabase.table("logged_meals")\
@@ -397,59 +403,83 @@ async def get_community_feed(
 async def like_meal(
     like_data: LikeRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
-    supabase: Client = Depends(get_supabase_client)
+    supabase: Client = Depends(get_authenticated_supabase_client)
 ):
     """
     Atomic community like endpoint.
-    Guarantees idempotency and prevents duplicate likes by tracking user likes in meal_likes table.
+    STRICT SECURITY RULE: The like counter is NEVER incremented if inserting
+    into meal_likes fails for any reason (duplicate like, authorization, etc.).
     """
     meal_id = like_data.meal_id
     user_id = current_user.user_id
 
+    # 1. Verify meal exists
     try:
-        # Check if meal exists
         meal_check = supabase.table("logged_meals").select("id, likes_count").eq("id", meal_id).execute()
-        if not meal_check.data:
-            raise HTTPException(status_code=404, detail=f"Meal with ID {meal_id} does not exist")
-
-        current_likes = meal_check.data[0].get("likes_count", 0) or 0
-
-        # Attempt to insert like into meal_likes table to prevent duplicates
-        try:
-            supabase.table("meal_likes").insert({
-                "meal_id": meal_id,
-                "user_id": user_id
-            }).execute()
-        except Exception as like_err:
-            # If unique constraint violation or duplicate detected
-            err_str = str(like_err).lower()
-            if "duplicate" in err_str or "unique" in err_str or "conflict" in err_str:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="You have already liked this meal"
-                )
-            # If meal_likes table does not exist in existing Supabase environment, log and proceed with atomic update
-            logger.warning(f"meal_likes check failed (table might be missing): {like_err}")
-
-        # Atomic increment via RPC if available, fallback to update
-        try:
-            rpc_res = supabase.rpc("increment_meal_likes", {"m_id": meal_id}).execute()
-            new_likes = rpc_res.data if rpc_res.data is not None else current_likes + 1
-        except Exception:
-            # Fallback direct update
-            new_likes = current_likes + 1
-            supabase.table("logged_meals").update({"likes_count": new_likes}).eq("id", meal_id).execute()
-
-        return {
-            "message": "Meal liked successfully",
-            "meal_id": meal_id,
-            "new_likes_count": new_likes
-        }
-    except HTTPException:
-        raise
     except Exception as exc:
-        logger.error(f"Failed to like meal {meal_id}: {exc}")
-        raise HTTPException(status_code=500, detail="Internal error updating like count")
+        logger.error(f"Error checking meal {meal_id}: {exc}")
+        raise HTTPException(status_code=500, detail="Error retrieving meal record")
+
+    if not meal_check.data:
+        raise HTTPException(status_code=404, detail=f"Meal with ID {meal_id} does not exist")
+
+    current_likes = meal_check.data[0].get("likes_count", 0) or 0
+
+    # 2. Try atomic database RPC function first (which runs both in one transaction)
+    try:
+        rpc_res = supabase.rpc("increment_meal_likes", {"m_id": meal_id}).execute()
+        if rpc_res.data is not None:
+            return {
+                "message": "Meal liked successfully",
+                "meal_id": meal_id,
+                "new_likes_count": rpc_res.data
+            }
+    except Exception as rpc_err:
+        err_msg = str(rpc_err).lower()
+        if "duplicate" in err_msg or "unique" in err_msg or "uq_meal_user_like" in err_msg:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="You have already liked this meal"
+            )
+        if "unauthorized" in err_msg or "permission denied" in err_msg:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Unauthorized to like this meal"
+            )
+        logger.info(f"RPC increment_meal_likes unavailable, falling back to manual atomic table transaction: {rpc_err}")
+
+    # 3. Fallback table operations: insert into meal_likes MUST succeed before updating counter
+    try:
+        supabase.table("meal_likes").insert({
+            "meal_id": meal_id,
+            "user_id": user_id
+        }).execute()
+    except Exception as like_insert_err:
+        err_str = str(like_insert_err).lower()
+        if "duplicate" in err_str or "unique" in err_str or "conflict" in err_str:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="You have already liked this meal"
+            )
+        logger.error(f"Cannot like meal: meal_likes insertion failed: {like_insert_err}")
+        # ABORT: Do not increment likes_count under any circumstance if insert fails
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to register meal like"
+        )
+
+    # 4. Only once like insertion is confirmed successful, update the counter
+    new_likes = current_likes + 1
+    try:
+        supabase.table("logged_meals").update({"likes_count": new_likes}).eq("id", meal_id).execute()
+    except Exception as update_err:
+        logger.error(f"Warning: Counter update failed after recording like: {update_err}")
+
+    return {
+        "message": "Meal liked successfully",
+        "meal_id": meal_id,
+        "new_likes_count": new_likes
+    }
 
 
 @app.get("/api/v1/community/leaderboard")
@@ -465,7 +495,6 @@ async def get_leaderboard(
     seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
     try:
-        # Try database-side aggregation function if created
         try:
             rpc_res = supabase.rpc("get_top_loggers_last_7_days", {"limit_count": 3}).execute()
             if rpc_res.data:
@@ -473,7 +502,6 @@ async def get_leaderboard(
         except Exception:
             pass
 
-        # Optimized filtered query: only select user_id for last 7 days
         response = supabase.table("logged_meals")\
             .select("user_id")\
             .gte("created_at", seven_days_ago)\
@@ -532,7 +560,6 @@ async def scan_barcode(
             raise HTTPException(status_code=400, detail=f"Failed to decode barcode from image: {str(e)}")
 
     if not barcode and barcode_number:
-        # Sanitize numeric/alphanumeric barcode
         clean_code = re.sub(r"[^0-9a-zA-Z]", "", barcode_number)
         if clean_code:
             barcode = clean_code
@@ -543,7 +570,6 @@ async def scan_barcode(
             detail="No barcode provided. Please upload an image or enter a valid barcode number."
         )
 
-    # Query OpenFoodFacts API asynchronously
     api_url = f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json"
     try:
         response = await http_client.get(api_url)
@@ -626,7 +652,6 @@ async def scan_label(file: UploadFile = File(...)):
         response = model.generate_content([prompt, image])
         text_resp = response.text.strip()
 
-        # Strip potential markdown code block markers
         text_resp = re.sub(r"^```(?:json)?\s*", "", text_resp)
         text_resp = re.sub(r"\s*```$", "", text_resp)
 

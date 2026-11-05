@@ -6,7 +6,7 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.28+-red.svg)
 ![TensorFlow](https://img.shields.io/badge/TensorFlow-2.15+-orange.svg)
-![Tests](https://img.shields.io/badge/Tests-19%20Passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/Tests-23%20Passing-brightgreen.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 **An intelligent nutrition tracking platform powered by AI, computer vision, and machine learning**

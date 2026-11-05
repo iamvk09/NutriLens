@@ -7,20 +7,34 @@ import pytest
 from starlette.testclient import TestClient
 
 from main import app
-from auth import get_current_user, get_supabase_client
+from auth import (
+    get_base_supabase_client,
+    get_supabase_client,
+    get_authenticated_supabase_client,
+)
 from config import settings
+
+
+@pytest.fixture(autouse=True)
+def setup_auth_env(mock_supabase):
+    settings.SUPABASE_URL = "https://mock.supabase.co"
+    settings.SUPABASE_KEY = "mock_anon_key"
+    settings.SUPABASE_JWT_SECRET = "super_secret_test_jwt_key_12345678"
+    app.dependency_overrides[get_base_supabase_client] = lambda: mock_supabase
+    app.dependency_overrides[get_supabase_client] = lambda: mock_supabase
+    app.dependency_overrides[get_authenticated_supabase_client] = lambda: mock_supabase
+    yield
+    app.dependency_overrides.clear()
 
 
 def test_unauthorized_access_to_protected_endpoints(mock_supabase):
     """Verifies that endpoints without Authorization header reject with 401."""
-    # Temporarily remove dependency override for get_current_user to test real auth dependency
-    app.dependency_overrides.clear()
-    app.dependency_overrides[get_supabase_client] = lambda: mock_supabase
     client = TestClient(app)
 
     # 1. log_meal
     res_log = client.post("/api/v1/log_meal", json={"food_name": "Apple", "calories": 50, "protein_g": 0.5, "fat_g": 0.1, "carb_g": 10})
     assert res_log.status_code == 401
+    assert "Missing Authorization header" in res_log.json()["detail"]
 
     # 2. history
     res_hist = client.get("/api/v1/history/test_user_123")
@@ -33,10 +47,6 @@ def test_unauthorized_access_to_protected_endpoints(mock_supabase):
 
 def test_valid_jwt_token_authentication(mock_supabase):
     """Verifies that a valid JWT token signed with SUPABASE_JWT_SECRET grants access."""
-    app.dependency_overrides.clear()
-    app.dependency_overrides[get_supabase_client] = lambda: mock_supabase
-    settings.SUPABASE_JWT_SECRET = "super_secret_test_jwt_key_12345678"
-
     token = jwt.encode(
         {"sub": "user_real_999", "email": "user999@test.com"},
         settings.SUPABASE_JWT_SECRET,
@@ -52,10 +62,6 @@ def test_valid_jwt_token_authentication(mock_supabase):
 
 def test_idor_protection_blocks_querying_other_users(mock_supabase):
     """Tests that a user cannot query another user's private meal history (IDOR protection)."""
-    app.dependency_overrides.clear()
-    app.dependency_overrides[get_supabase_client] = lambda: mock_supabase
-    settings.SUPABASE_JWT_SECRET = "super_secret_test_jwt_key_12345678"
-
     token = jwt.encode(
         {"sub": "attacker_user_id", "email": "attacker@test.com"},
         settings.SUPABASE_JWT_SECRET,
@@ -72,10 +78,6 @@ def test_idor_protection_blocks_querying_other_users(mock_supabase):
 
 def test_malformed_jwt_token_rejected(mock_supabase):
     """Verifies that invalid or corrupted tokens return 401."""
-    app.dependency_overrides.clear()
-    app.dependency_overrides[get_supabase_client] = lambda: mock_supabase
-    settings.SUPABASE_JWT_SECRET = "super_secret_test_jwt_key_12345678"
-
     headers = {"Authorization": "Bearer not_a_valid_token"}
     client = TestClient(app)
     res = client.get("/api/v1/history/user1", headers=headers)

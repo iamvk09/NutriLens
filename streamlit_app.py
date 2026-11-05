@@ -379,11 +379,11 @@ def main_app():
                         """, unsafe_allow_html=True)
                         b1, b2 = st.columns(2)
                         with b1:
-                            if st.button("❤️", key=f"l_{idx}"):
+                            if st.button("❤️", key=f"l_{idx}", help="Like this meal"):
                                 requests.post(f"{API_URL}/community/like", json={"meal_id": meal.get('id')})
                                 st.rerun()
                         with b2:
-                            if st.button("👨‍🍳", key=f"c_{idx}"):
+                            if st.button("👨‍🍳", key=f"c_{idx}", help="Cook this recipe in AI Chef"):
                                 st.session_state['last_food'] = meal.get('food_name')
                                 st.toast("Recipe loaded!")
             else:
@@ -415,23 +415,26 @@ def main_app():
         st.title("Shopping List")
         c1, c2 = st.columns([3, 1])
         with c1:
-            ni = st.text_input("Add Item")
+            ni = st.text_input("Add Item", placeholder="e.g., 2 apples, almond milk...")
         with c2:
             st.write("")
             st.write("")
-            if st.button("Add"):
-                supabase.table("shopping_list").insert({"user_id": user_id, "item": ni}).execute()
+            if st.button("Add", disabled=not (ni and ni.strip())):
+                supabase.table("shopping_list").insert({"user_id": user_id, "item": ni.strip()}).execute()
                 st.rerun()
         
         items = supabase.table("shopping_list").select("*").eq("user_id", user_id).execute().data
-        for i in items:
-            c1, c2 = st.columns([0.1, 0.9])
-            with c1:
-                if st.button("✕", key=f"d_{i['id']}"):
-                    supabase.table("shopping_list").delete().eq("id", i['id']).execute()
-                    st.rerun()
-            with c2:
-                st.write(i['item'])
+        if not items:
+            st.info("🛒 Your shopping list is empty. Add items above or generate them with AI Chef!")
+        else:
+            for i in items:
+                c1, c2 = st.columns([0.1, 0.9])
+                with c1:
+                    if st.button("✕", key=f"d_{i['id']}", help="Remove item"):
+                        supabase.table("shopping_list").delete().eq("id", i['id']).execute()
+                        st.rerun()
+                with c2:
+                    st.write(i['item'])
 
     # --- BARCODE ---
     if selected == "Barcode":

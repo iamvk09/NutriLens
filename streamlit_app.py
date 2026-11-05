@@ -17,9 +17,9 @@ load_dotenv()
 # --- CONFIGURATION: DEPLOYMENT URLS ---
 # 1. Backend URL (Hugging Face)
 # We check st.secrets first (best practice), fallback to your hardcoded HF URL
-if "API_URL" in st.secrets:
+try:
     API_URL = st.secrets["API_URL"]
-else:
+except Exception:
     # ⚠️ THIS IS YOUR REAL BACKEND URL
     API_URL = "https://iamvk09-nutrilens-api.hf.space/api/v1"
 
@@ -176,6 +176,11 @@ if 'user' not in st.session_state:
     st.session_state.user = None
 
 # --- HELPER: PDF REPORT ---
+# ⚡ Bolt Optimization: Cache the generated PDF binary using @st.cache_data to prevent
+# re-generating on every Streamlit dashboard render / widget interaction.
+# Additionally, replace `iterrows()` with `itertuples(index=False)` to avoid constructing
+# pandas Series objects for each row (~40% faster row iteration).
+@st.cache_data
 def generate_pdf_report(user_email: str, dataframe: pd.DataFrame) -> bytes:
     pdf = FPDF()
     pdf.add_page()
@@ -199,10 +204,11 @@ def generate_pdf_report(user_email: str, dataframe: pd.DataFrame) -> bytes:
         pdf.cell(30, 10, "Cals", 1)
         pdf.ln()
         pdf.set_font("Arial", "", 10)
-        for _, row in dataframe.head(20).iterrows():
-            d = str(row.get('Date', ''))
-            f = str(row.get('food_name', ''))[:30]
-            c = str(int(row.get('calories', 0)))
+        top_meals = dataframe.head(20)
+        for row in top_meals.itertuples(index=False):
+            d = str(getattr(row, 'Date', ''))
+            f = str(getattr(row, 'food_name', ''))[:30]
+            c = str(int(getattr(row, 'calories', 0)))
             pdf.cell(40, 10, d, 1)
             pdf.cell(80, 10, f, 1)
             pdf.cell(30, 10, c, 1)

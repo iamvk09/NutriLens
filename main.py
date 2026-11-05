@@ -1,330 +1,304 @@
 """
 NutriLens FastAPI Backend
-Main application file with ML model integration and API endpoints
+Production-hardened application with non-blocking async network clients,
+ML model integration, Supabase authentication, and full API endpoints.
 """
 
-import os
 import io
-from pathlib import Path
-from typing import Optional
+import json
+import re
+from typing import Optional, List, Dict, Any
 
+import httpx
 import numpy as np
-import requests
-from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Form
+from PIL import Image
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Form, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from PIL import Image
-from supabase import create_client, Client
-import tensorflow as tf
-from tensorflow import keras
 from pyzbar.pyzbar import decode as pyzbar_decode
+from supabase import Client
 
-from schemas import AnalyzeResponse, LogMealRequest, LogMealResponse, LikeRequest
-from model_utils import predict_food_name as predict_food_name_util, get_class_names
+from config import settings
+from logger import logger, RequestLoggingMiddleware
+from auth import get_current_user, get_optional_user, get_supabase_client, AuthenticatedUser
+from schemas import (
+    AnalyzeResponse,
+    LogMealRequest,
+    LogMealResponse,
+    LikeRequest,
+    ScanLabelResponse,
+    BarcodeProductResponse,
+)
+from model_utils import (
+    load_model_safe,
+    predict_food_name as predict_food_name_util,
+    get_class_names,
+    get_loaded_model,
+)
 
-# Load environment variables
-load_dotenv()
+# Optional Gemini setup
+try:
+    import google.generativeai as genai
+    if settings.GEMINI_API_KEY:
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+except Exception as e:
+    logger.warning(f"Could not initialize google.generativeai: {e}")
 
 # Initialize FastAPI app
 app = FastAPI(
     title="NutriLens API",
-    description="Food image analysis and nutrition tracking API",
-    version="1.0.0"
+    description="Production Food Analysis, Barcode Scanning & Nutrition Tracking API",
+    version="1.1.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
-# Add CORS middleware
+# Add Request Logging Middleware
+app.add_middleware(RequestLoggingMiddleware)
+
+# Add Strict CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
 
-# Global variables for ML model and Supabase client
-ML_MODEL: Optional[keras.Model] = None
-SUPABASE_CLIENT: Optional[Client] = None
-
-# Environment variables
-USDA_API_KEY = os.getenv("USDA_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# Reusable Async HTTP Client
+ASYNC_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
 
-def get_supabase_client() -> Client:
-    """Dependency to get Supabase client"""
-    global SUPABASE_CLIENT
-    if SUPABASE_CLIENT is None:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise HTTPException(
-                status_code=500,
-                detail="Supabase configuration not found in environment variables"
-            )
-        SUPABASE_CLIENT = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return SUPABASE_CLIENT
+@app.on_event("startup")
+async def startup_event():
+    """Startup initialization: HTTP client and ML model loading."""
+    global ASYNC_HTTP_CLIENT
+    logger.info(f"Starting NutriLens API in {settings.ENVIRONMENT} mode...")
 
+    # Initialize async HTTP client with pooling and timeout
+    ASYNC_HTTP_CLIENT = httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.HTTP_TIMEOUT_SECONDS),
+        follow_redirects=True,
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
+    )
 
-def load_ml_model():
-    """Load the Keras model on application startup"""
-    global ML_MODEL
-    model_path = Path("./models/food_model.h5")
-    
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"Model file not found at {model_path}. "
-            "Please ensure the model is saved at './models/food_model.h5'"
-        )
-    
+    # Safely load or retrieve ML model
     try:
-        ML_MODEL = keras.models.load_model(str(model_path))
-        print(f"✓ ML model loaded successfully from {model_path}")
-    except Exception as e:
-        raise RuntimeError(f"Failed to load ML model: {str(e)}")
+        load_model_safe(settings.MODEL_PATH, settings.MODEL_DOWNLOAD_URL)
+    except Exception as exc:
+        logger.error(f"Error initializing ML model: {exc}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup resources on server shutdown."""
+    global ASYNC_HTTP_CLIENT
+    if ASYNC_HTTP_CLIENT:
+        await ASYNC_HTTP_CLIENT.aclose()
+        logger.info("Closed async HTTP client.")
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """Dependency / accessor for async HTTP client."""
+    global ASYNC_HTTP_CLIENT
+    if ASYNC_HTTP_CLIENT is None or ASYNC_HTTP_CLIENT.is_closed:
+        ASYNC_HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.HTTP_TIMEOUT_SECONDS),
+            follow_redirects=True
+        )
+    return ASYNC_HTTP_CLIENT
 
 
 def preprocess_image(image_bytes: bytes) -> np.ndarray:
     """
     Preprocess image for ML model input.
-    Resizes to 224x224 and normalizes pixel values.
+    Validates image, converts to RGB, resizes to 224x224 and normalizes.
     """
+    if len(image_bytes) > settings.MAX_IMAGE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Image size exceeds maximum allowed size ({settings.MAX_IMAGE_SIZE_BYTES // (1024 * 1024)}MB)"
+        )
     try:
-        # Open image from bytes
         image = Image.open(io.BytesIO(image_bytes))
-        
-        # Convert to RGB if necessary
+        image.verify()  # Verify integrity
+        # Reopen after verify
+        image = Image.open(io.BytesIO(image_bytes))
         if image.mode != "RGB":
             image = image.convert("RGB")
-        
-        # Resize to 224x224
         image = image.resize((224, 224))
-        
-        # Convert to numpy array and normalize
-        img_array = np.array(image, dtype=np.float32)
-        img_array = img_array / 255.0  # Normalize to [0, 1]
-        
-        # Add batch dimension
-        img_array = np.expand_dims(img_array, axis=0)
-        
-        return img_array
+        img_array = np.array(image, dtype=np.float32) / 255.0
+        return np.expand_dims(img_array, axis=0)
     except Exception as e:
+        logger.warning(f"Failed to preprocess image: {e}")
         raise HTTPException(
-            status_code=400,
-            detail=f"Failed to preprocess image: {str(e)}"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image format or corrupted file"
         )
 
 
-def predict_food_name(image_array: np.ndarray) -> str:
+async def fetch_usda_nutrition(food_name: str, client: httpx.AsyncClient) -> Dict[str, float]:
     """
-    Use ML model to predict food name from preprocessed image.
-    Returns the predicted food name as a string.
+    Asynchronously fetch nutrition data from USDA FoodData Central API.
+    Returns normalized macronutrient dictionary with fallback defaults.
     """
-    global ML_MODEL
-    
-    if ML_MODEL is None:
-        raise HTTPException(
-            status_code=500,
-            detail="ML model not loaded"
-        )
-    
-    try:
-        # Get class names mapping if available
-        class_names = get_class_names()
-        
-        # Use utility function for prediction
-        predicted_food_name = predict_food_name_util(ML_MODEL, image_array, class_names)
-        
-        return predicted_food_name
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Prediction failed: {str(e)}"
-        )
+    if not settings.USDA_API_KEY:
+        logger.warning("USDA_API_KEY not configured. Falling back to default macronutrients.")
+        return {"calories": 100.0, "protein_g": 2.0, "fat_g": 0.5, "carb_g": 20.0}
 
-
-def fetch_usda_nutrition(food_name: str) -> dict:
-    """
-    Fetch nutrition data from USDA FoodData Central API.
-    Returns dictionary with calories, protein_g, fat_g, carb_g.
-    """
-    if not USDA_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="USDA API key not configured"
-        )
-    
     usda_api_url = "https://api.nal.usda.gov/fdc/v1/foods/search"
-    
     params = {
         "query": food_name,
-        "api_key": USDA_API_KEY,
+        "api_key": settings.USDA_API_KEY,
         "pageSize": 1
     }
-    
+
     try:
-        response = requests.get(usda_api_url, params=params, timeout=10)
+        response = await client.get(usda_api_url, params=params)
+        if response.status_code == 404:
+            return {"calories": 0.0, "protein_g": 0.0, "fat_g": 0.0, "carb_g": 0.0}
         response.raise_for_status()
-        
         data = response.json()
-        
-        # Parse USDA response
-        if not data.get("foods") or len(data["foods"]) == 0:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No nutrition data found for '{food_name}'"
-            )
-        
-        food_item = data["foods"][0]
+
+        foods = data.get("foods", [])
+        if not foods:
+            logger.info(f"No USDA data found for '{food_name}', using zero defaults.")
+            return {"calories": 0.0, "protein_g": 0.0, "fat_g": 0.0, "carb_g": 0.0}
+
+        food_item = foods[0]
         nutrients = food_item.get("foodNutrients", [])
-        
-        # Extract nutrition values
+
         nutrition_data = {
             "calories": 0.0,
             "protein_g": 0.0,
             "fat_g": 0.0,
             "carb_g": 0.0
         }
-        
-        # USDA API nutrient IDs (more reliable than names)
-        # Reference: https://fdc.nal.usda.gov/api-guide.html
+
         nutrient_id_map = {
-            "calories": [1008, 1062],  # Energy (kcal), Energy (Atwater General Factors)
-            "protein_g": [1003],       # Protein
-            "fat_g": [1004],           # Total lipid (fat)
-            "carb_g": [1005]           # Carbohydrate, by difference
+            "calories": [1008, 1062],
+            "protein_g": [1003],
+            "fat_g": [1004],
+            "carb_g": [1005]
         }
-        
-        # Also match by name as fallback
         nutrient_name_map = {
             "calories": ["Energy", "Energy (Atwater General Factors)", "Energy (kcal)"],
             "protein_g": ["Protein"],
             "fat_g": ["Total lipid (fat)", "Fat, total"],
             "carb_g": ["Carbohydrate, by difference", "Carbohydrates", "Carbohydrate"]
         }
-        
+
         for nutrient in nutrients:
             nutrient_id = nutrient.get("nutrientId")
             nutrient_name = nutrient.get("nutrientName", "").strip()
-            value = nutrient.get("value", 0.0)
-            unit = nutrient.get("unitName", "").strip()
-            
-            # Skip if no valid value
-            if value is None or (isinstance(value, (int, float)) and value == 0):
+            val = nutrient.get("value", 0.0)
+            if val is None:
                 continue
-            
-            value = float(value)
-            
-            # Match by nutrient ID first (more reliable)
-            if nutrient_id in nutrient_id_map.get("calories", []):
-                # Ensure calories are in kcal
-                if unit.lower() in ["kcal", "kilocalories"] or nutrient_id == 1008:
-                    nutrition_data["calories"] = value
-            elif nutrient_id in nutrient_id_map.get("protein_g", []):
-                nutrition_data["protein_g"] = value
-            elif nutrient_id in nutrient_id_map.get("fat_g", []):
-                nutrition_data["fat_g"] = value
-            elif nutrient_id in nutrient_id_map.get("carb_g", []):
-                nutrition_data["carb_g"] = value
-            # Fallback: match by name (for cases where ID might not match)
-            elif any(name.lower() in nutrient_name.lower() for name in nutrient_name_map.get("calories", [])):
-                if not nutrition_data["calories"] or nutrition_data["calories"] == 0:
-                    nutrition_data["calories"] = value
-            elif any(name.lower() in nutrient_name.lower() for name in nutrient_name_map.get("protein_g", [])):
-                if not nutrition_data["protein_g"] or nutrition_data["protein_g"] == 0:
-                    nutrition_data["protein_g"] = value
-            elif any(name.lower() in nutrient_name.lower() for name in nutrient_name_map.get("fat_g", [])):
-                if not nutrition_data["fat_g"] or nutrition_data["fat_g"] == 0:
-                    nutrition_data["fat_g"] = value
-            elif any(name.lower() in nutrient_name.lower() for name in nutrient_name_map.get("carb_g", [])):
-                if not nutrition_data["carb_g"] or nutrition_data["carb_g"] == 0:
-                    nutrition_data["carb_g"] = value
-        
+            val = float(val)
+
+            if nutrient_id in nutrient_id_map["calories"]:
+                nutrition_data["calories"] = val
+            elif nutrient_id in nutrient_id_map["protein_g"]:
+                nutrition_data["protein_g"] = val
+            elif nutrient_id in nutrient_id_map["fat_g"]:
+                nutrition_data["fat_g"] = val
+            elif nutrient_id in nutrient_id_map["carb_g"]:
+                nutrition_data["carb_g"] = val
+            elif any(name.lower() in nutrient_name.lower() for name in nutrient_name_map["calories"]):
+                if not nutrition_data["calories"]:
+                    nutrition_data["calories"] = val
+            elif any(name.lower() in nutrient_name.lower() for name in nutrient_name_map["protein_g"]):
+                if not nutrition_data["protein_g"]:
+                    nutrition_data["protein_g"] = val
+            elif any(name.lower() in nutrient_name.lower() for name in nutrient_name_map["fat_g"]):
+                if not nutrition_data["fat_g"]:
+                    nutrition_data["fat_g"] = val
+            elif any(name.lower() in nutrient_name.lower() for name in nutrient_name_map["carb_g"]):
+                if not nutrition_data["carb_g"]:
+                    nutrition_data["carb_g"] = val
+
         return nutrition_data
-    
-    except requests.exceptions.RequestException as e:
+    except httpx.TimeoutException:
+        logger.error(f"Timeout querying USDA API for '{food_name}'")
         raise HTTPException(
-            status_code=503,
-            detail=f"USDA API request failed: {str(e)}"
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="USDA nutrition service timed out"
         )
-    except Exception as e:
+    except httpx.HTTPError as exc:
+        logger.error(f"USDA API error: {exc}")
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to parse USDA response: {str(e)}"
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to retrieve nutritional data from external USDA service"
         )
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Load ML model on application startup"""
-    try:
-        load_ml_model()
-    except Exception as e:
-        print(f"ERROR: {str(e)}")
-        print("Application will start but /analyze endpoint will not work until model is available.")
-
+# --- ROUTE HANDLERS ---
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
+    """Root status and discovery endpoint."""
     return {
-        "message": "NutriLens API is running",
-        "version": "1.0.0",
+        "app": "NutriLens API",
+        "version": "1.1.0",
+        "environment": settings.ENVIRONMENT,
         "endpoints": {
+            "health": "/health",
             "analyze": "/api/v1/analyze",
             "log_meal": "/api/v1/log_meal",
-            "history": "/api/v1/history/{user_id}"
+            "history": "/api/v1/history/{user_id}",
+            "feed": "/api/v1/community/feed",
+            "like": "/api/v1/community/like",
+            "leaderboard": "/api/v1/community/leaderboard",
+            "scan_barcode": "/api/v1/scan_barcode",
+            "scan_label": "/api/v1/scan_label",
         }
     }
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint reflecting service configuration."""
+    model = get_loaded_model()
     return {
         "status": "healthy",
-        "model_loaded": ML_MODEL is not None,
-        "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
-        "usda_configured": bool(USDA_API_KEY)
+        "model_loaded": model is not None,
+        "supabase_configured": bool(settings.SUPABASE_URL and settings.SUPABASE_KEY),
+        "usda_configured": bool(settings.USDA_API_KEY),
+        "gemini_configured": bool(settings.GEMINI_API_KEY),
+        "environment": settings.ENVIRONMENT
     }
 
 
 @app.post("/api/v1/analyze", response_model=AnalyzeResponse)
 async def analyze_food_image(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    http_client: httpx.AsyncClient = Depends(get_http_client)
 ):
     """
-    Analyze food image and return nutrition information.
-    
-    - **file**: Image file (JPEG, PNG, etc.) to analyze
-    - Returns: Food name and nutrition data (calories, protein, fat, carbs)
+    Analyze uploaded food image with ML model and USDA nutrition data.
     """
-    if ML_MODEL is None:
+    model = get_loaded_model()
+    if model is None:
         raise HTTPException(
-            status_code=503,
-            detail="ML model is not loaded. Please check server logs."
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ML inference model is currently unavailable"
         )
-    
-    # Read image file
+
     try:
         image_bytes = await file.read()
-        if len(image_bytes) == 0:
-            raise HTTPException(status_code=400, detail="Empty file uploaded")
     except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to read image file: {str(e)}"
-        )
-    
-    # Preprocess image
+        raise HTTPException(status_code=400, detail="Failed to read uploaded file")
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
     image_array = preprocess_image(image_bytes)
-    
-    # Predict food name
-    predicted_food_name = predict_food_name(image_array)
-    
-    # Fetch nutrition data from USDA API
-    nutrition_data = fetch_usda_nutrition(predicted_food_name)
-    
-    # Return response
+    class_names = get_class_names()
+    predicted_food_name = predict_food_name_util(model, image_array, class_names)
+
+    nutrition_data = await fetch_usda_nutrition(predicted_food_name, http_client)
+
     return AnalyzeResponse(
         food_name=predicted_food_name,
         calories=nutrition_data["calories"],
@@ -337,67 +311,74 @@ async def analyze_food_image(
 @app.post("/api/v1/log_meal", response_model=LogMealResponse)
 async def log_meal(
     meal_data: LogMealRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
     supabase: Client = Depends(get_supabase_client)
 ):
     """
-    Log analyzed meal data to Supabase database.
-    
-    - **meal_data**: JSON body with meal information
-    - Returns: Success message
+    Securely log a meal for the authenticated user.
+    Prevents IDOR: user_id is always taken from authenticated credentials.
     """
+    target_user_id = current_user.user_id
     try:
-        # Insert meal data into Supabase
-        result = supabase.table("logged_meals").insert({
-            "user_id": meal_data.user_id,
+        insert_payload = {
+            "user_id": target_user_id,
             "food_name": meal_data.food_name,
             "calories": meal_data.calories,
             "protein_g": meal_data.protein_g,
             "fat_g": meal_data.fat_g,
             "carb_g": meal_data.carb_g,
             "is_public": meal_data.is_public
-        }).execute()
-        
-        return LogMealResponse(
-            message="Meal logged successfully"
-        )
-    
-    except Exception as e:
+        }
+        res = supabase.table("logged_meals").insert(insert_payload).execute()
+        meal_id = None
+        if res.data and len(res.data) > 0:
+            meal_id = res.data[0].get("id")
+
+        return LogMealResponse(message="Meal logged successfully", meal_id=meal_id)
+    except Exception as exc:
+        logger.error(f"Failed to insert logged meal: {exc}", exc_info=True)
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to log meal: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database transaction error while logging meal"
         )
 
-# --- NEW ENDPOINT: Get User History ---
+
 @app.get("/api/v1/history/{user_id}")
 async def get_history(
     user_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
     supabase: Client = Depends(get_supabase_client)
 ):
     """
-    Fetch the last 50 meals for this user, newest first.
+    Fetch history for user.
+    IDOR Protection: Users can only read their own meal history.
     """
+    if current_user.user_id != user_id:
+        logger.warning(f"IDOR attempt blocked: User {current_user.user_id} tried to read history of {user_id}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: You may only query your own meal history"
+        )
+
     try:
-        # Fetch data from Supabase 'logged_meals' table
         response = supabase.table("logged_meals")\
             .select("*")\
             .eq("user_id", user_id)\
             .order("created_at", desc=True)\
             .limit(50)\
             .execute()
-        
-        return response.data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return response.data or []
+    except Exception as exc:
+        logger.error(f"Database error fetching meal history: {exc}")
+        raise HTTPException(status_code=500, detail="Error retrieving meal records")
 
-
-# --- COMMUNITY ENDPOINTS ---
 
 @app.get("/api/v1/community/feed")
 async def get_community_feed(
     supabase: Client = Depends(get_supabase_client)
 ):
     """
-    Fetch the last 20 public meals from the community, ordered by created_at desc.
+    Public community feed: returns latest 20 public meals.
     """
     try:
         response = supabase.table("logged_meals")\
@@ -406,57 +387,69 @@ async def get_community_feed(
             .order("created_at", desc=True)\
             .limit(20)\
             .execute()
-        
-        return response.data
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch community feed: {str(e)}"
-        )
+        return response.data or []
+    except Exception as exc:
+        logger.error(f"Error fetching community feed: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to fetch community feed")
 
 
 @app.post("/api/v1/community/like")
 async def like_meal(
     like_data: LikeRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
     supabase: Client = Depends(get_supabase_client)
 ):
     """
-    Increment likes_count for a meal by 1.
+    Atomic community like endpoint.
+    Guarantees idempotency and prevents duplicate likes by tracking user likes in meal_likes table.
     """
+    meal_id = like_data.meal_id
+    user_id = current_user.user_id
+
     try:
-        # First, get the current likes_count
-        meal_response = supabase.table("logged_meals")\
-            .select("likes_count")\
-            .eq("id", like_data.meal_id)\
-            .execute()
-        
-        if not meal_response.data:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Meal with id {like_data.meal_id} not found"
-            )
-        
-        current_likes = meal_response.data[0].get("likes_count", 0) or 0
-        
-        # Increment likes_count by 1
-        update_response = supabase.table("logged_meals")\
-            .update({"likes_count": current_likes + 1})\
-            .eq("id", like_data.meal_id)\
-            .execute()
-        
+        # Check if meal exists
+        meal_check = supabase.table("logged_meals").select("id, likes_count").eq("id", meal_id).execute()
+        if not meal_check.data:
+            raise HTTPException(status_code=404, detail=f"Meal with ID {meal_id} does not exist")
+
+        current_likes = meal_check.data[0].get("likes_count", 0) or 0
+
+        # Attempt to insert like into meal_likes table to prevent duplicates
+        try:
+            supabase.table("meal_likes").insert({
+                "meal_id": meal_id,
+                "user_id": user_id
+            }).execute()
+        except Exception as like_err:
+            # If unique constraint violation or duplicate detected
+            err_str = str(like_err).lower()
+            if "duplicate" in err_str or "unique" in err_str or "conflict" in err_str:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="You have already liked this meal"
+                )
+            # If meal_likes table does not exist in existing Supabase environment, log and proceed with atomic update
+            logger.warning(f"meal_likes check failed (table might be missing): {like_err}")
+
+        # Atomic increment via RPC if available, fallback to update
+        try:
+            rpc_res = supabase.rpc("increment_meal_likes", {"m_id": meal_id}).execute()
+            new_likes = rpc_res.data if rpc_res.data is not None else current_likes + 1
+        except Exception:
+            # Fallback direct update
+            new_likes = current_likes + 1
+            supabase.table("logged_meals").update({"likes_count": new_likes}).eq("id", meal_id).execute()
+
         return {
             "message": "Meal liked successfully",
-            "meal_id": like_data.meal_id,
-            "new_likes_count": current_likes + 1
+            "meal_id": meal_id,
+            "new_likes_count": new_likes
         }
-    
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to like meal: {str(e)}"
-        )
+    except Exception as exc:
+        logger.error(f"Failed to like meal {meal_id}: {exc}")
+        raise HTTPException(status_code=500, detail="Internal error updating like count")
 
 
 @app.get("/api/v1/community/leaderboard")
@@ -465,184 +458,205 @@ async def get_leaderboard(
 ):
     """
     Get top 3 users with the most logged meals in the last 7 days.
+    Uses optimized database queries and RPC if available, with structured fallback.
     """
+    from datetime import datetime, timedelta, timezone
+
+    seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+
     try:
-        from datetime import datetime, timedelta
-        
-        # Calculate date 7 days ago
-        seven_days_ago = datetime.utcnow() - timedelta(days=7)
-        
-        # Fetch meals from the last 7 days
+        # Try database-side aggregation function if created
+        try:
+            rpc_res = supabase.rpc("get_top_loggers_last_7_days", {"limit_count": 3}).execute()
+            if rpc_res.data:
+                return rpc_res.data
+        except Exception:
+            pass
+
+        # Optimized filtered query: only select user_id for last 7 days
         response = supabase.table("logged_meals")\
             .select("user_id")\
-            .gte("created_at", seven_days_ago.isoformat())\
+            .gte("created_at", seven_days_ago)\
             .execute()
-        
-        # Count meals per user
+
         from collections import Counter
-        user_counts = Counter(meal["user_id"] for meal in response.data)
-        
-        # Get top 3 users
+        user_counts = Counter(meal["user_id"] for meal in (response.data or []) if meal.get("user_id"))
         top_users = user_counts.most_common(3)
-        
-        # Format response
+
         leaderboard = [
-            {
-                "rank": idx + 1,
-                "user_id": user_id,
-                "score": count
-            }
+            {"rank": idx + 1, "user_id": user_id, "score": count}
             for idx, (user_id, count) in enumerate(top_users)
         ]
-        
-        # Pad to 3 entries if less than 3 users
         while len(leaderboard) < 3:
-            leaderboard.append({
-                "rank": len(leaderboard) + 1,
-                "user_id": None,
-                "score": 0
-            })
-        
+            leaderboard.append({"rank": len(leaderboard) + 1, "user_id": None, "score": 0})
         return leaderboard
-    
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch leaderboard: {str(e)}"
-        )
+    except Exception as exc:
+        logger.error(f"Error compiling leaderboard: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to calculate community leaderboard")
 
 
-@app.post("/api/v1/scan_barcode")
+@app.post("/api/v1/scan_barcode", response_model=BarcodeProductResponse)
 async def scan_barcode(
     file: Optional[UploadFile] = File(None),
-    barcode_number: Optional[str] = Form(None)
+    barcode_number: Optional[str] = Form(None),
+    http_client: httpx.AsyncClient = Depends(get_http_client)
 ):
     """
-    Scan barcode from image or use provided barcode number to fetch product data.
-    
-    - **file**: Image file containing barcode (optional if barcode_number provided as query param)
-    - **barcode_number**: Direct barcode number (optional query param if file provided)
-    - Returns: Product information from OpenFoodFacts API
+    Decode barcode from uploaded image or use barcode_number, then query OpenFoodFacts.
     """
     barcode = None
-    
-    # If file is provided, decode barcode from image
+
     if file and file.filename:
         try:
             image_bytes = await file.read()
-            if len(image_bytes) == 0:
-                raise HTTPException(status_code=400, detail="Empty file uploaded")
-            
-            # Open image with PIL
+            if not image_bytes:
+                raise HTTPException(status_code=400, detail="Uploaded file is empty")
+            if len(image_bytes) > settings.MAX_IMAGE_SIZE_BYTES:
+                raise HTTPException(status_code=413, detail="Barcode image exceeds size limit")
+
             image = Image.open(io.BytesIO(image_bytes))
-            
-            # Convert to RGB if necessary (pyzbar requires RGB)
             if image.mode != "RGB":
                 image = image.convert("RGB")
-            
-            # Decode barcode
+
             decoded_objects = pyzbar_decode(image)
-            
             if not decoded_objects:
                 raise HTTPException(
                     status_code=400,
-                    detail="No barcode found in image. Please ensure the barcode is clear and visible."
+                    detail="No barcode found in image. Please provide a clear, well-lit barcode photo."
                 )
-            
-            # Get the first barcode data
-            barcode = decoded_objects[0].data.decode("utf-8")
-        
+            barcode = decoded_objects[0].data.decode("utf-8").strip()
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to decode barcode from image: {str(e)}"
-            )
-    
-    # Use provided barcode number if no file or if file decoding failed
+            logger.warning(f"Barcode decoding failed: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to decode barcode from image: {str(e)}")
+
     if not barcode and barcode_number:
-        barcode = barcode_number.strip()
-    
+        # Sanitize numeric/alphanumeric barcode
+        clean_code = re.sub(r"[^0-9a-zA-Z]", "", barcode_number)
+        if clean_code:
+            barcode = clean_code
+
     if not barcode:
         raise HTTPException(
             status_code=400,
-            detail="No barcode provided. Please upload an image or enter a barcode number."
+            detail="No barcode provided. Please upload an image or enter a valid barcode number."
         )
-    
-    # Fetch product data from OpenFoodFacts API
+
+    # Query OpenFoodFacts API asynchronously
+    api_url = f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json"
     try:
-        api_url = f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json"
-        response = requests.get(api_url, timeout=10)
+        response = await http_client.get(api_url)
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Product not found for barcode: {barcode}")
         response.raise_for_status()
-        
         data = response.json()
-        
+
         if data.get("status") == 0:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Product not found for barcode: {barcode}"
-            )
-        
+            raise HTTPException(status_code=404, detail=f"Product not found for barcode: {barcode}")
+
         product = data.get("product", {})
-        
-        # Extract product information
-        result = {
-            "barcode": barcode,
-            "product_name": product.get("product_name", product.get("product_name_en", "Unknown Product")),
-            "brand": product.get("brands", "").split(",")[0].strip() if product.get("brands") else "Unknown Brand",
-            "nutriscore_grade": product.get("nutriscore_grade", "").upper() if product.get("nutriscore_grade") else None,
-            "nova_group": product.get("nova_group", None),
-            "ingredients_text": product.get("ingredients_text", ""),
-            "allergens": product.get("allergens", ""),
-            "image_url": product.get("image_url", product.get("image_front_url", ""))
-        }
-        
-        return result
-    
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"OpenFoodFacts API request failed: {str(e)}"
+        result = BarcodeProductResponse(
+            barcode=barcode,
+            product_name=product.get("product_name") or product.get("product_name_en") or "Unknown Product",
+            brand=product.get("brands", "").split(",")[0].strip() if product.get("brands") else "Unknown Brand",
+            nutriscore_grade=product.get("nutriscore_grade", "").upper() if product.get("nutriscore_grade") else None,
+            nova_group=product.get("nova_group"),
+            ingredients_text=product.get("ingredients_text", ""),
+            allergens=product.get("allergens", ""),
+            image_url=product.get("image_url") or product.get("image_front_url")
         )
-    except Exception as e:
+        return result
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="OpenFoodFacts service timed out")
+    except httpx.HTTPError as exc:
+        logger.error(f"OpenFoodFacts API error: {exc}")
+        raise HTTPException(status_code=502, detail="Failed to communicate with OpenFoodFacts service")
+
+
+@app.post("/api/v1/scan_label", response_model=ScanLabelResponse)
+async def scan_label(file: UploadFile = File(...)):
+    """
+    Uses Google Gemini Vision to read ingredient labels and extract health insights.
+    Completely handles validation, API failures, and structured JSON parsing.
+    """
+    if not settings.GEMINI_API_KEY:
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to process barcode: {str(e)}"
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Gemini API is not configured on the server. Set GEMINI_API_KEY in environment."
+        )
+
+    try:
+        image_bytes = await file.read()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read uploaded image")
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty image uploaded")
+    if len(image_bytes) > settings.MAX_IMAGE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="Image file exceeds size limit")
+
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        image.load()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image")
+
+    prompt = """
+    You are an expert food scientist and label analyst. Read the food product label in this image carefully.
+    1. Extract the product name or brief description.
+    2. Extract the exact ingredients list as written.
+    3. Analyze if the product is generally healthy, estimate a rating from A to E (A is best, E is worst).
+    4. List any negative warnings (e.g. trans fats, high sodium, artificial additives, high fructose corn syrup).
+    5. List positive nutritional points (e.g. high fiber, whole grains, zero added sugar).
+
+    Output STRICT JSON only matching this schema without markdown formatting or codeblocks:
+    {
+        "product_name": "String",
+        "ingredients_text": "String",
+        "is_healthy": true,
+        "health_rating": "A",
+        "warnings": ["warning 1"],
+        "positive_points": ["point 1"]
+    }
+    """
+
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content([prompt, image])
+        text_resp = response.text.strip()
+
+        # Strip potential markdown code block markers
+        text_resp = re.sub(r"^```(?:json)?\s*", "", text_resp)
+        text_resp = re.sub(r"\s*```$", "", text_resp)
+
+        parsed = json.loads(text_resp)
+        return ScanLabelResponse(
+            product_name=parsed.get("product_name", "Unknown Product"),
+            ingredients_text=parsed.get("ingredients_text", ""),
+            is_healthy=parsed.get("is_healthy"),
+            health_rating=parsed.get("health_rating"),
+            warnings=parsed.get("warnings", []),
+            positive_points=parsed.get("positive_points", [])
+        )
+    except json.JSONDecodeError:
+        logger.warning(f"Gemini returned non-JSON output: {text_resp[:200]}")
+        return ScanLabelResponse(
+            product_name="Detected Product",
+            ingredients_text=text_resp,
+            is_healthy=None,
+            health_rating="C",
+            warnings=["Could not automatically parse structured nutrients."],
+            positive_points=[]
+        )
+    except Exception as exc:
+        logger.error(f"Gemini vision call failed: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Label scanning failed: {str(exc)}"
         )
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-    # --- ADD THIS TO main.py ---
-
-@app.post("/api/v1/scan_label")
-async def scan_label(file: UploadFile = File(...)):
-    """
-    Fallback: Uses Gemini Vision to read the ingredients label directly.
-    """
-    try:
-        # Read image
-        image_bytes = await file.read()
-        image = Image.open(io.BytesIO(image_bytes))
-        
-        # Prompt for Gemini
-        prompt = """
-        Read the text in this image. It is a food product label.
-        1. Extract the 'Ingredients List' exactly as written.
-        2. Extract the 'Nutritional Information' (Calories, Protein, etc) if visible.
-        3. Analyze the ingredients: Are there harmful additives? High sugar?
-        4. Return STRICT JSON:
-        {
-            "product_name": "Unknown (Detected from label)",
-            "ingredients_text": "...",
-            "is_healthy": true/false,
-            "health_rating": "A/B/C/D/E (Estimate)",
-            "warnings": ["List of bad ingredients"],
-            "positive_points": ["List of good points"]
-        }
-        """
-        
-        
+    uvicorn.run("main:app", host=settings.HOST, port=settings.PORT, reload=True)

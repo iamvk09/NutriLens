@@ -40,11 +40,20 @@ class Settings(BaseSettings):
     # External APIs
     USDA_API_KEY: Optional[str] = Field(default=None, description="USDA FoodData Central API key")
     GEMINI_API_KEY: Optional[str] = Field(default=None, description="Google Gemini API key")
+    GEMINI_MODEL: str = Field(default="gemini-3.5-flash", description="Gemini model identifier for OCR and recipe generation")
 
     # ML Model Configuration
-    MODEL_PATH: str = Field(default="./models/food_model.h5", description="Path to Keras model file")
+    MODEL_PATH: str = Field(default="./models/food_model.onnx", description="Path to ONNX model file")
     CLASS_NAMES_PATH: str = Field(default="./models/class_names.json", description="Path to class names JSON")
     MODEL_DOWNLOAD_URL: Optional[str] = Field(default=None, description="Remote URL to fetch model binary if missing")
+    MODEL_EXPECTED_SHA256: Optional[str] = Field(
+        default="aa6157a28f37bd797fa6e9b09e24bdd1243aa93f9fcbbc0ea3d198c0f9e6f7cd",
+        description="Expected SHA256 checksum for model binary validation"
+    )
+    MODEL_EXPECTED_SIZE_BYTES: Optional[int] = Field(
+        default=14571154,
+        description="Expected model binary size in bytes"
+    )
 
     # Request & Upload Limits
     MAX_IMAGE_SIZE_BYTES: int = Field(default=10 * 1024 * 1024, description="Max upload size (10 MB)")

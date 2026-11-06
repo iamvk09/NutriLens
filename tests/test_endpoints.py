@@ -218,7 +218,7 @@ def test_scan_barcode_missing_input_fails(test_client):
 
 
 def test_scan_label_mocked(test_client, sample_image_bytes):
-    """Tests /api/v1/scan_label with mock Gemini Vision response."""
+    """Tests /api/v1/scan_label with mock Google GenAI response."""
     files = {"file": ("label.jpg", sample_image_bytes, "image/jpeg")}
 
     mock_gemini_json = json.dumps({
@@ -233,11 +233,18 @@ def test_scan_label_mocked(test_client, sample_image_bytes):
     old_key = settings.GEMINI_API_KEY
     settings.GEMINI_API_KEY = "test_mock_gemini_key"
     try:
-        with patch("google.generativeai.GenerativeModel") as mock_model_cls:
-            mock_instance = mock_model_cls.return_value
-            mock_resp = mock_instance.generate_content.return_value
-            mock_resp.text = f"```json\n{mock_gemini_json}\n```"
+        class MockGenerateResponse:
+            text = f"```json\n{mock_gemini_json}\n```"
 
+        class MockModels:
+            def generate_content(self, model, contents, **kwargs):
+                return MockGenerateResponse()
+
+        class MockGenAIClient:
+            models = MockModels()
+
+        import main
+        with patch.object(main, "GENAI_CLIENT", MockGenAIClient()):
             res = test_client.post("/api/v1/scan_label", files=files)
             assert res.status_code == 200
             data = res.json()

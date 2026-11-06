@@ -2,8 +2,10 @@ import React, { useState } from 'react';
 import { Sparkles, Mail, Lock, ArrowRight, ShieldCheck } from 'lucide-react';
 import { supabase } from '../services/supabase';
 
+import { User } from '../types';
+
 interface AuthModalProps {
-  onSuccess: (user: { id: string; email: string }, token: string) => void;
+  onSuccess: (user: User, token: string) => void;
 }
 
 export const AuthModal: React.FC<AuthModalProps> = ({ onSuccess }) => {
@@ -50,8 +52,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({ onSuccess }) => {
 
   const handleGuestEntry = () => {
     onSuccess(
-      { id: 'demo_guest_user', email: 'guest@nutrilens.app' },
-      'guest_access_token'
+      { id: 'guest_local_user', email: 'guest@nutrilens.local', isGuest: true },
+      '' // No token for guest
     );
   };
 

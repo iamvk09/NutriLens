@@ -44,12 +44,13 @@ from model_utils import (
 )
 
 # Optional Gemini setup
+GENAI_CLIENT: Any = None
 try:
-    import google.generativeai as genai
     if settings.GEMINI_API_KEY:
-        genai.configure(api_key=settings.GEMINI_API_KEY)
+        from google import genai
+        GENAI_CLIENT = genai.Client(api_key=settings.GEMINI_API_KEY)
 except Exception as e:
-    logger.warning(f"Could not initialize google.generativeai: {e}")
+    logger.warning(f"Could not initialize google.genai: {e}")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -90,7 +91,12 @@ async def startup_event():
     )
 
     try:
-        load_model_safe(settings.MODEL_PATH, settings.MODEL_DOWNLOAD_URL)
+        load_model_safe(
+            model_path=settings.MODEL_PATH,
+            download_url=settings.MODEL_DOWNLOAD_URL,
+            expected_sha256=settings.MODEL_EXPECTED_SHA256,
+            expected_size=settings.MODEL_EXPECTED_SIZE_BYTES
+        )
     except Exception as exc:
         logger.error(f"Error initializing ML model: {exc}")
 
@@ -662,9 +668,22 @@ async def scan_label(file: UploadFile = File(...)):
     """
 
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content([prompt, image])
-        text_resp = response.text.strip()
+        global GENAI_CLIENT
+        if GENAI_CLIENT is None and settings.GEMINI_API_KEY:
+            from google import genai
+            GENAI_CLIENT = genai.Client(api_key=settings.GEMINI_API_KEY)
+
+        if not GENAI_CLIENT:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Gemini client could not be initialized."
+            )
+
+        response = GENAI_CLIENT.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=[prompt, image]
+        )
+        text_resp = response.text.strip() if response and response.text else ""
 
         text_resp = re.sub(r"^```(?:json)?\s*", "", text_resp)
         text_resp = re.sub(r"\s*```$", "", text_resp)

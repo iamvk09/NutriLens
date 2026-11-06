@@ -1,4 +1,7 @@
-# Backend & Core Framework
+# Production FastAPI Backend Dependencies (NutriLens V2)
+# Lightweight, microsecond ONNX inference without heavy TensorFlow/Keras or Streamlit overhead
+
+# Core Framework & Server
 fastapi>=0.104.0,<1.0.0
 uvicorn[standard]>=0.24.0,<1.0.0
 pydantic>=2.5.0,<3.0.0
@@ -12,24 +15,11 @@ requests>=2.31.0,<3.0.0
 supabase>=2.3.0,<3.0.0
 pyjwt[crypto]>=2.8.0,<3.0.0
 
-# Machine Learning & Image Processing
-tensorflow>=2.15.0
-keras>=3.0.0
+# Production ML Engine & Vision (Zero TensorFlow runtime overhead)
+onnxruntime>=1.16.0,<2.0.0
 numpy>=1.24.0,<3.0.0
 Pillow>=10.0.0,<14.0.0
 pyzbar>=0.1.9
 
-# AI Integrations
-google-generativeai>=0.8.0
-
-# Frontend UI & Visualizations
-streamlit>=1.28.0,<2.0.0
-streamlit-option-menu>=0.3.6
-pandas>=2.0.0,<4.0.0
-plotly>=5.18.0,<8.0.0
-fpdf2>=2.7.0,<3.0.0
-
-# Testing & Quality Assurance
-pytest>=7.4.0,<10.0.0
-pytest-asyncio>=0.21.0,<2.0.0
-pytest-cov>=4.1.0,<8.0.0
+# Google Gemini Interactions API (Current official SDK)
+google-genai>=1.0.0

@@ -6,6 +6,7 @@ import { exportHealthPdf } from '../utils/pdfReport';
 interface DashboardTabProps {
   meals: LoggedMeal[];
   userEmail: string;
+  isGuest?: boolean;
   loading: boolean;
   onRefresh: () => void;
 }
@@ -13,6 +14,7 @@ interface DashboardTabProps {
 export const DashboardTab: React.FC<DashboardTabProps> = ({
   meals,
   userEmail,
+  isGuest,
   loading,
 }) => {
   const [filterPeriod, setFilterPeriod] = useState<'all' | '7d' | '30d'>('all');

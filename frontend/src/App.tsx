@@ -42,6 +42,12 @@ export function App() {
 
   const loadMeals = async () => {
     if (!currentUser) return;
+    if (currentUser.isGuest) {
+      // Local client storage for guest mode
+      const saved = localStorage.getItem('nutrilens_guest_meals');
+      if (saved) setUserMeals(JSON.parse(saved));
+      return;
+    }
     setLoadingHistory(true);
     try {
       const data = await fetchUserHistory(currentUser.id, token);
@@ -95,6 +101,7 @@ export function App() {
         currentTab={currentTab}
         onSelectTab={setCurrentTab}
         userEmail={currentUser.email}
+        isGuest={currentUser.isGuest}
         onLogout={handleLogout}
       />
 
@@ -102,6 +109,7 @@ export function App() {
         {currentTab === 'tracker' && (
           <TrackerTab
             token={token}
+            isGuest={currentUser.isGuest}
             onMealLogged={loadMeals}
             onCookRecipe={handleCookInChef}
           />
@@ -110,6 +118,7 @@ export function App() {
           <DashboardTab
             meals={userMeals}
             userEmail={currentUser.email}
+            isGuest={currentUser.isGuest}
             loading={loadingHistory}
             onRefresh={loadMeals}
           />
@@ -117,11 +126,12 @@ export function App() {
         {currentTab === 'community' && (
           <CommunityTab
             token={token}
+            isGuest={currentUser.isGuest}
             onCookRecipe={handleCookInChef}
           />
         )}
         {currentTab === 'groceries' && (
-          <GroceriesTab userId={currentUser.id} />
+          <GroceriesTab userId={currentUser.id} isGuest={currentUser.isGuest} />
         )}
         {currentTab === 'chef' && (
           <ChefTab

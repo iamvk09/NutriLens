@@ -1,25 +1,30 @@
 # NutriLens V2 Cost & Cloud Resource Analysis
 
-## 1. Hosting Architecture & Free-Tier Limits
+## 1. Hosting Architecture & Free-Tier Realities
 
-The core design principle of NutriLens V2 is to maintain recurring operational costs at **₹0.00 / month ($0.00)** using legitimate always-free allowances without reliance on temporary promotional credits.
+NutriLens V2 is designed for zero recurring software license costs and low-overhead hosting. However, production uptime and cloud provider constraints must be clearly distinguished from promotional marketing claims.
 
-| Component | Provider & Tier | Free Allowance | Expected Usage | Risk of Charges | Mitigation Safeguards |
+| Component | Provider & Tier | Quota & Free Allowance | Realistic Operational Behavior | Downtime & Billing Risks | Mitigation Strategy |
 |---|---|---|---|---|---|
-| **Frontend Application** | **Cloudflare Pages** (Always Free) | Unlimited bandwidth, 500 builds/month, global anycast CDN | ~100–500 MB / mo | **Zero Risk** (Card not required, free tier does not auto-upgrade) | Built-in DDoS protection, automatic SSL, no bandwidth metering |
-| **Backend API Service** | **Render Free Web Service** / **Fly.io** | 750 free instance hours / month, 512 MB RAM | ~100–200 hours / mo (spins down when inactive) | **Zero Risk** (Instance spins down, does not charge overage) | ONNX Runtime reduces RAM to ~48 MB, comfortably below 512 MB limit |
-| **Inference Engine** | **Client-Side (User Device WASM/WebGL) + Server ONNX** | 100% Client-side compute | Infinite zero-cost client inferences | **Zero Risk** | Offloads image tensors from cloud egress and CPU compute |
-| **PostgreSQL Database** | **Supabase Free Tier** | 500 MB database, 1 GB file storage, 50,000 monthly active users | <15 MB for thousands of meal records | **Zero Risk** (Pauses if inactive after weeks, project stays free) | Row Level Security, efficient foreign key indexes, JSON logging |
-| **User Authentication** | **Supabase GoTrue Auth** | 50,000 MAU free forever, OAuth & Email | ~100–500 active users | **Zero Risk** | JWT verification, client-side session storage |
-| **Nutrition Data API** | **USDA FoodData Central** | Free government public API key | 1,000 req/hour | **Zero Risk** (Free public service) | Client caching + portion calculations in memory |
-| **Barcode Scanning** | **OpenFoodFacts** | Free community open-data JSON API | Unlimited reasonable rate-limit | **Zero Risk** (Free open-source database) | Direct client/server async requests |
-| **AI Recipe & OCR** | **Google Gemini 1.5 Flash (Free Tier)** | 15 RPM (Requests Per Minute), 1M TPM, 1,500 RPD | ~10–50 requests / day | **Zero Risk** (Hard capped at free-tier quota, rejects overages without billing) | Fallback template recipes & local validation when quota reached |
+| **Frontend Application** | **Cloudflare Pages** (Free Tier) | Unlimited bandwidth, 500 monthly builds, global anycast CDN | Zero cold starts, fast global edge delivery | **Zero financial risk**. High traffic is absorbed without automated billing. | Automatic SSL, static asset caching. |
+| **Backend API Service** | **Render Web Service** (Free Instance) | 750 free instance hours / month, 512 MB RAM | **Spins down after 15 minutes of inactivity**. First incoming request encounters ~30-50s cold-start spinup latency. | Free tier has strict limits; will sleep when idle. Cannot offer 99.9% commercial SLA for free. | ONNX runtime cuts RAM to ~48 MB (preventing OOM crashes). For 24/7 uptime, upgrade to paid tier ($7/mo) requires explicit user approval. |
+| **Backend API (Alternative)** | **Fly.io** | Limited credit allowance depending on account eligibility and location | Requires valid credit card for signup; subject to region availability and change in free allowances. | Moderate billing risk if exceeded or if trial expires. | Default to Render free or containerized self-hosted. |
+| **Inference Engine** | **Server-Side ONNX Runtime** | Included in container runtime | 1.6 ms CPU execution time. 14.5 MB model binary. | No external per-inference API cost. | Standardized opset 15 on CPU. Zero GPU cost. |
+| **Database & Identity** | **Supabase** (Free Tier) | 500 MB database, 1 GB storage, 50,000 monthly active users | **Inactivity Pause**: Free projects automatically pause after 7 days of complete inactivity and must be manually restored via dashboard. | No unexpected credit card billing (free tier pauses instead of charging). | PostgreSQL Row Level Security (RLS) protects data isolation. Regular active usage keeps DB active. |
+| **Nutrition Data API** | **USDA FoodData Central** | Free US government public API | 1,000 requests per hour with API key | Service outage or rate-limiting if key is exhausted. | In-memory portion calculations and fallback nutritional profiles. |
+| **Barcode Scanning** | **OpenFoodFacts** | Free public community database | Generous rate-limiting | Dependent on community crowd-sourced barcode availability. | User can enter barcode manually or enter food title directly. |
+| **AI Recipe & OCR** | **Google Gemini Interactions API** | Free tier quota (15 RPM / 1,500 RPD) | Fast response on supported models (`gemini-3.5-flash`). Subject to temporary 503 high-demand spikes. | Free tier rejects overages with HTTP 429 rather than charging card. | Configurable `GEMINI_MODEL`, graceful JSON parsing fallback, offline culinary recipes. |
 
 ---
 
-## 2. Monthly Estimated Cost Summary
+## 2. Hobby vs. Production-Grade SLA Comparison
 
-- **Promotional Credits Used**: ₹0 ($0.00)
-- **Temporary Trials Used**: None
-- **Total Estimated Monthly Recurring Cost**: **₹0.00 / month**
-- **Billing Prevention**: No paid cloud subscriptions or payment profiles required to deploy.
+| Metric | Free / Hobby Deployment | Production-Grade Upgrade (Paid) |
+|---|---|---|
+| **Monthly Cost** | **₹0.00 / month ($0.00)** | **~$12.00–$25.00 / month** |
+| **Backend Availability** | Sleeps after 15m idle (30s cold start) | 24/7 zero-cold-start dedicated container |
+| **Database State** | Auto-pauses if idle for 7 days | Pro tier ($25/mo) never pauses |
+| **SLA Guarantee** | Best-effort, no financial guarantee | 99.9% uptime SLA with daily automated backups |
+| **Credit Card Requirement** | None (Render + Cloudflare Pages) | Required for paid tier upgrades |
+
+*Never assume a cloud provider provides permanent commercial-grade hosting for free. NutriLens V2 achieves ₹0/month operation by adhering strictly to genuine free limits.*

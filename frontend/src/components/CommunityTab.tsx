@@ -5,11 +5,13 @@ import { fetchCommunityFeed, fetchLeaderboard, likeMeal } from '../services/api'
 
 interface CommunityTabProps {
   token: string | null;
+  isGuest?: boolean;
   onCookRecipe: (foodName: string) => void;
 }
 
 export const CommunityTab: React.FC<CommunityTabProps> = ({
   token,
+  isGuest,
   onCookRecipe,
 }) => {
   const [activeSubTab, setActiveSubTab] = useState<'feed' | 'leaderboard'>('feed');
@@ -39,6 +41,10 @@ export const CommunityTab: React.FC<CommunityTabProps> = ({
   }, []);
 
   const handleLike = async (mealId: number) => {
+    if (isGuest) {
+      alert("Sign in to like meals in the community.");
+      return;
+    }
     if (likedMeals[mealId]) return;
     try {
       const newCount = await likeMeal(mealId, token);

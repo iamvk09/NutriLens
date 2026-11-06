@@ -5,16 +5,17 @@ import { supabase } from '../services/supabase';
 
 interface GroceriesTabProps {
   userId: string;
+  isGuest?: boolean;
 }
 
-export const GroceriesTab: React.FC<GroceriesTabProps> = ({ userId }) => {
+export const GroceriesTab: React.FC<GroceriesTabProps> = ({ userId, isGuest }) => {
   const [items, setItems] = useState<ShoppingItem[]>([]);
   const [newItemText, setNewItemText] = useState('');
   const [loading, setLoading] = useState(false);
 
   const loadGroceries = async () => {
-    if (!supabase) {
-      // Demo fallback in local mode
+    if (isGuest || !supabase) {
+      // Local client storage for guest
       const saved = localStorage.getItem(`nutrilens_groceries_${userId}`);
       if (saved) setItems(JSON.parse(saved));
       return;
@@ -48,7 +49,7 @@ export const GroceriesTab: React.FC<GroceriesTabProps> = ({ userId }) => {
     const trimmed = newItemText.trim();
     setNewItemText('');
 
-    if (!supabase) {
+    if (isGuest || !supabase) {
       const newItem: ShoppingItem = {
         id: Date.now(),
         user_id: userId,
@@ -77,7 +78,7 @@ export const GroceriesTab: React.FC<GroceriesTabProps> = ({ userId }) => {
   };
 
   const handleDeleteItem = async (id: number) => {
-    if (!supabase) {
+    if (isGuest || !supabase) {
       const updated = items.filter((i) => i.id !== id);
       setItems(updated);
       localStorage.setItem(`nutrilens_groceries_${userId}`, JSON.stringify(updated));

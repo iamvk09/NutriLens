@@ -6,12 +6,14 @@ import { analyzeFoodImage, logMeal } from '../services/api';
 
 interface TrackerTabProps {
   token: string | null;
+  isGuest?: boolean;
   onMealLogged: () => void;
   onCookRecipe: (foodName: string) => void;
 }
 
 export const TrackerTab: React.FC<TrackerTabProps> = ({
   token,
+  isGuest,
   onMealLogged,
   onCookRecipe,
 }) => {
@@ -282,7 +284,12 @@ export const TrackerTab: React.FC<TrackerTabProps> = ({
               </div>
 
               {/* Log Action Button */}
-              {logSuccess ? (
+              {isGuest ? (
+                <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs text-center space-y-1">
+                  <p className="font-semibold">Guest Mode (Read-Only Preview)</p>
+                  <p className="text-gray-400">Sign in with an account to persist meals to your private health diary.</p>
+                </div>
+              ) : logSuccess ? (
                 <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center space-x-2 text-emerald-400 font-medium text-sm">
                   <Check className="w-5 h-5" />
                   <span>Meal Logged Successfully!</span>

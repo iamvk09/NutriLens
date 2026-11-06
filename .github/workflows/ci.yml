@@ -2,23 +2,23 @@ name: CI
 
 on:
   push:
-    branches: [ main, feature/remediation-hardening-4914751557843883736, feature-remediation-hardening-4914751557843883736 ]
+    branches: [ v2 ]
   pull_request:
-    branches: [ main ]
+    branches: [ v2 ]
 
 jobs:
-  test:
-    name: Run Automated Test Suite
+  backend-test:
+    name: Backend Test Suite & ONNX Validation
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
           cache: "pip"
 
       - name: Install system dependencies
@@ -30,17 +30,49 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
-      - name: Verify Python Compilation
+      - name: Verify Python Compilation & Import Hygiene
         run: |
-          python -m py_compile main.py streamlit_app.py auth.py config.py logger.py model_utils.py schemas.py
+          python -m py_compile main.py auth.py config.py logger.py model_utils.py schemas.py
+          # Verify that importing model_utils does NOT load tensorflow into sys.modules
+          python -c "import model_utils, sys; assert 'tensorflow' not in sys.modules, 'TensorFlow should not be loaded on ONNX path'"
+
+      - name: Verify ONNX Model Architecture & Validation Logic
+        run: |
+          python -c "import model_utils; res = model_utils.load_model_safe('models/food_model.onnx'); assert res is not None, 'Failed to load ONNX model'"
 
       - name: Run Pytest
         env:
           SUPABASE_URL: https://mock.supabase.co
-          SUPABASE_KEY: mock-anon-key
+          SUPABASE_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U
           SUPABASE_JWT_SECRET: test_ci_jwt_secret_12345678901234567890
           USDA_API_KEY: mock-usda-key
           ENVIRONMENT: test
         run: |
           pytest -v
+
+  frontend-build:
+    name: Frontend Build, Lint & Typecheck
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build TypeScript & Vite bundle
+        run: npm run build

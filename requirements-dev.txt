@@ -1,0 +1,12 @@
+# Development & Testing Requirements for NutriLens V2
+-r requirements.txt
+
+# Testing & Quality Assurance
+pytest>=7.4.0,<10.0.0
+pytest-asyncio>=0.21.0,<2.0.0
+pytest-cov>=4.1.0,<8.0.0
+
+# Legacy testing & conversion utilities (optional, isolated from production)
+fpdf2>=2.7.0,<3.0.0
+pandas>=2.0.0,<4.0.0
+plotly>=5.18.0,<8.0.0

@@ -5,6 +5,7 @@ interface NavbarProps {
   currentTab: string;
   onSelectTab: (tab: string) => void;
   userEmail: string;
+  isGuest?: boolean;
   onLogout: () => void;
 }
 
@@ -12,6 +13,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   currentTab,
   onSelectTab,
   userEmail,
+  isGuest,
   onLogout,
 }) => {
   const navItems = [
@@ -63,7 +65,14 @@ export const Navbar: React.FC<NavbarProps> = ({
           {/* User profile & actions */}
           <div className="flex items-center space-x-3">
             <div className="hidden sm:block text-right">
-              <p className="text-xs text-gray-400">Signed in as</p>
+              <div className="flex items-center justify-end space-x-1.5">
+                <p className="text-xs text-gray-400">Signed in as</p>
+                {isGuest && (
+                  <span className="text-[10px] font-semibold bg-amber-500/20 text-amber-400 px-1.5 py-0.2 rounded border border-amber-500/30">
+                    Guest Mode
+                  </span>
+                )}
+              </div>
               <p className="text-xs font-semibold text-gray-200 truncate max-w-[150px]">{userEmail}</p>
             </div>
             <button

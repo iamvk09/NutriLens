@@ -2,28 +2,26 @@
 
 ## 1. Architectural Overview
 
-NutriLens V2 transitions from a monolithic Streamlit script to a modern, decoupled cloud architecture:
-- **Client Layer**: React 19 + TypeScript + Vite Single-Page Application (SPA) with responsive TailwindCSS, hosted on Cloudflare Pages edge CDN.
-- **Inference Layer**: Dual-mode machine learning runtime:
-  - Client-side execution option with zero cloud latency.
-  - Server-side ONNX Runtime CPU execution (14.5 MB, ~1.6 ms latency, ~48 MB RAM) replacing the heavy 450 MB TensorFlow dependency.
-- **Backend Service Layer**: Production FastAPI server providing authenticated REST endpoints, non-blocking asynchronous HTTP clients (`httpx`), and structured request logging.
-- **Database & Identity Layer**: Supabase PostgreSQL featuring Row Level Security (RLS), atomic stored procedures for likes and leaderboards, and GoTrue JWT verification.
-- **External Intelligence**: USDA FoodData Central, OpenFoodFacts, and Google Gemini AI.
+NutriLens V2 uses a decoupled, high-performance architecture:
+- **Client Application**: Single-Page Application (SPA) built with React 19, TypeScript, and TailwindCSS, hosted globally on Cloudflare Pages.
+- **Inference Engine**: Server-Side **ONNX Runtime** (MobileNetV2 Food-101) hosted in a lightweight Python container (~48 MB RAM, ~1.6 ms latency), eliminating TensorFlow and Keras dependencies from production.
+- **Backend API**: FastAPI service managing non-blocking network operations, USDA FoodData Central integration, OpenFoodFacts barcode resolution, and Google Gemini AI OCR analysis.
+- **Data & Identity**: Supabase PostgreSQL with Row Level Security (RLS) and GoTrue JWT verification.
 
 ```
 +-------------------------------------------------------------+
 |          Cloudflare Pages: React + TypeScript SPA           |
 |  - Fast Camera / Photo Upload  - Real-time Charts / PDF    |
-|  - In-Browser Barcode Scan     - Interactive Shopping List  |
+|  - OpenFoodFacts Barcodes      - Interactive Groceries      |
+|  - Guest Read-Only Mode        - Secure Supabase OAuth/JWT  |
 +------------------------------+------------------------------+
-                               | (JWT Bearer / HTTPS)
+                               | (HTTPS / REST)
                                v
 +-------------------------------------------------------------+
 |             Render / Docker: FastAPI Backend (:8000)        |
 |  - Non-blocking Async Clients (httpx)                       |
-|  - Microsecond ONNX Runtime Food-101 Classifier             |
-|  - JWT Role & Subject IDOR Validation                       |
+|  - Microsecond Server ONNX Runtime Engine (14.5 MB Model)   |
+|  - Cryptographic JWT Subject & IDOR Validation              |
 +--------+--------------------+---------------------+---------+
          |                    |                     |
          v                    v                     v
@@ -45,18 +43,9 @@ NutriLens V2 transitions from a monolithic Streamlit script to a modern, decoupl
   - `top_predictions`: Top 3 alternative predictions with confidences.
   - `calories`, `protein_g`, `fat_g`, `carb_g`: Nutritional profile.
   - `source`: `'USDA'` or `'FALLBACK_ESTIMATE'`.
-  - `is_verified`: Boolean flag indicating whether values originate from a direct database match.
+  - `is_verified`: Boolean flag indicating direct database match.
 
-### `/api/v1/log_meal` (POST)
-- **Headers**: `Authorization: Bearer <JWT>`
-- **Input**:
-  - `food_name`: 1–100 characters.
-  - `calories`: 0.0 – 10,000.0 kcal.
-  - `protein_g`, `fat_g`, `carb_g`: 0.0 – 1,000.0 g.
-  - `is_public`: Boolean toggle.
-- **Security**: Server extracts `auth.uid()` from the verified JWT and overrides any client-supplied `user_id`.
-
-### `/api/v1/community/like` (POST)
-- **Headers**: `Authorization: Bearer <JWT>`
-- **Input**: `meal_id: int`
-- **Behavior**: Executes `increment_meal_likes` atomic SQL stored procedure. Returns `409 Conflict` if the meal was previously liked by the calling user.
+### `/api/v1/scan_label` (POST)
+- **Input**: Multipart file `file`.
+- **Engine**: Google Gemini API via official `google-genai` SDK using configurable model (`gemini-3.5-flash`).
+- **Output**: Product name, ingredients, health rating (A-E), warnings, and health highlights.

@@ -1,37 +1,46 @@
 """
 NutriLens Machine Learning Utilities
-Provides model loading, automated retrieval, inference optimization,
-and class mapping for food recognition.
+Provides model loading, automated retrieval with SHA256 verification,
+ONNX Runtime inference optimization, dimension validation, and class mapping.
 """
 
+import hashlib
 import json
 import os
+import tempfile
 import urllib.request
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Tuple
 import numpy as np
 
 # Global references
 _LOADED_MODEL: Any = None
 _CLASS_NAMES: Optional[Dict[int, str]] = None
 _IS_GENUINE_MODEL: bool = False
+_MODEL_METADATA: Dict[str, Any] = {}
 
 
-def configure_tensorflow_runtime():
-    """Configures TensorFlow memory growth and threading if TensorFlow is present."""
-    try:
-        import tensorflow as tf
-        gpus = tf.config.list_physical_devices("GPU")
-        if gpus:
-            for gpu in gpus:
-                try:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                except Exception:
-                    pass
-        tf.config.threading.set_inter_op_parallelism_threads(2)
-        tf.config.threading.set_intra_op_parallelism_threads(4)
-    except Exception:
-        pass
+def verify_file_checksum(filepath: Path, expected_sha256: Optional[str], expected_size: Optional[int]) -> bool:
+    """Verifies file size and SHA256 checksum to prevent corrupted or partial binaries."""
+    if not filepath.exists():
+        return False
+
+    actual_size = filepath.stat().st_size
+    if expected_size is not None and actual_size != expected_size:
+        print(f"Warning: File {filepath} size mismatch (got {actual_size}, expected {expected_size})")
+        return False
+
+    if expected_sha256:
+        sha256 = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha256.update(chunk)
+        digest = sha256.hexdigest()
+        if digest.lower() != expected_sha256.lower():
+            print(f"Warning: File {filepath} SHA256 mismatch (got {digest}, expected {expected_sha256})")
+            return False
+
+    return True
 
 
 def load_class_names(class_names_path: Optional[str] = None) -> Optional[Dict[int, str]]:
@@ -66,64 +75,139 @@ def get_class_names() -> Dict[int, str]:
     return _CLASS_NAMES
 
 
-def download_model_if_needed(model_path: str, download_url: Optional[str]) -> bool:
-    """Attempts to download model binary from remote URL if missing."""
+def download_model_if_needed(
+    model_path: str,
+    download_url: Optional[str],
+    expected_sha256: Optional[str] = None,
+    expected_size: Optional[int] = None
+) -> bool:
+    """
+    Attempts to download model binary from remote URL to a temporary file,
+    validates its integrity before atomically moving it into place.
+    Prevents partial or corrupted downloads from being loaded.
+    """
     target = Path(model_path)
     if target.exists() and target.stat().st_size > 0:
-        return True
+        if expected_sha256 or expected_size:
+            if verify_file_checksum(target, expected_sha256, expected_size):
+                return True
+            print(f"Warning: Existing model at {target} failed validation. Re-downloading...")
+        else:
+            return True
 
     if not download_url:
         return False
 
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        print(f"Downloading ML model from {download_url} to {target}...")
-        urllib.request.urlretrieve(download_url, str(target))
-        print(f"ML model successfully downloaded to {target}")
+        print(f"Downloading ML model artifact from {download_url}...")
+        
+        # Download to a temporary file in the same directory first
+        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False, suffix=".tmp") as tmp_file:
+            tmp_path = Path(tmp_file.name)
+            urllib.request.urlretrieve(download_url, str(tmp_path))
+
+        # Validate downloaded artifact
+        if not verify_file_checksum(tmp_path, expected_sha256, expected_size):
+            tmp_path.unlink(missing_ok=True)
+            raise ValueError(f"Downloaded model from {download_url} failed integrity verification.")
+
+        # Atomic replacement
+        tmp_path.replace(target)
+        print(f"✓ ML model successfully verified and positioned at {target}")
         return True
     except Exception as exc:
-        print(f"Warning: Failed to download model from {download_url}: {exc}")
+        print(f"Warning: Failed to download or verify model from {download_url}: {exc}")
         return False
 
 
-def load_model_safe(model_path: str = "./models/food_model.onnx", download_url: Optional[str] = None):
+def validate_onnx_model(sess: Any, class_names_path: Optional[str] = None) -> Dict[str, Any]:
     """
-    Safely loads the genuine model (preferring fast ONNX Runtime, with Keras fallback).
-    Does NOT fabricate pseudo-AI predictions when the binary is absent.
-    Sets _IS_GENUINE_MODEL=True if successfully loaded.
+    Validates ONNX model input/output signature and cross-checks class_names.json dimensions.
     """
-    global _LOADED_MODEL, _IS_GENUINE_MODEL
-    configure_tensorflow_runtime()
+    inputs = sess.get_inputs()
+    outputs = sess.get_outputs()
 
-    # Check for ONNX first
-    onnx_path = Path("./models/food_model.onnx")
-    if onnx_path.exists() and onnx_path.stat().st_size > 0:
-        try:
-            import onnxruntime as ort
-            sess = ort.InferenceSession(str(onnx_path))
-            _LOADED_MODEL = sess
-            _IS_GENUINE_MODEL = True
-            print(f"✓ High-performance ONNX model loaded successfully from {onnx_path}")
-            return _LOADED_MODEL
-        except Exception as exc:
-            print(f"Warning: Could not load ONNX model at {onnx_path}: {exc}")
+    if not inputs or not outputs:
+        raise ValueError("ONNX model has invalid or empty inputs/outputs.")
 
-    download_model_if_needed(model_path, download_url)
+    input_meta = inputs[0]
+    output_meta = outputs[0]
+
+    # Validate shape dimensions: expects [batch, 224, 224, 3] or [batch, 3, 224, 224]
+    in_shape = input_meta.shape
+    if len(in_shape) != 4:
+        raise ValueError(f"Unexpected ONNX input rank: {in_shape}. Expected 4D tensor (NHWC or NCHW).")
+
+    # Output dimensions check against class names
+    out_shape = output_meta.shape
+    num_classes = out_shape[-1] if len(out_shape) >= 2 else None
+
+    class_names = load_class_names(class_names_path)
+    if class_names and num_classes and isinstance(num_classes, int):
+        if len(class_names) != num_classes:
+            raise ValueError(
+                f"Class names count ({len(class_names)}) does not match ONNX output classes ({num_classes})."
+            )
+
+    return {
+        "input_name": input_meta.name,
+        "input_shape": in_shape,
+        "input_type": input_meta.type,
+        "output_name": output_meta.name,
+        "output_shape": out_shape,
+        "output_type": output_meta.type,
+        "num_classes": num_classes,
+    }
+
+
+def load_model_safe(
+    model_path: str = "./models/food_model.onnx",
+    download_url: Optional[str] = None,
+    expected_sha256: Optional[str] = None,
+    expected_size: Optional[int] = None
+):
+    """
+    Safely loads the production ONNX model without loading TensorFlow.
+    Uses configured model_path directly.
+    Sets _IS_GENUINE_MODEL=True if successfully validated and loaded.
+    """
+    global _LOADED_MODEL, _IS_GENUINE_MODEL, _MODEL_METADATA
+
+    # Attempt download if configured and missing
+    download_model_if_needed(model_path, download_url, expected_sha256, expected_size)
 
     target = Path(model_path)
     if target.exists() and target.stat().st_size > 0:
-        try:
-            import keras
-            _LOADED_MODEL = keras.models.load_model(str(target))
-            _IS_GENUINE_MODEL = True
-            print(f"✓ Trained Keras model loaded successfully from {target}")
-            return _LOADED_MODEL
-        except Exception as exc:
-            print(f"Warning: Could not load Keras model at {target}: {exc}")
+        # 1. Primary Production Path: ONNX Runtime
+        if str(target).endswith(".onnx"):
+            try:
+                import onnxruntime as ort
+                sess = ort.InferenceSession(str(target))
+                metadata = validate_onnx_model(sess)
+                _LOADED_MODEL = sess
+                _IS_GENUINE_MODEL = True
+                _MODEL_METADATA = metadata
+                print(f"✓ Validated ONNX model loaded successfully from {target} ({metadata['num_classes']} classes)")
+                return _LOADED_MODEL
+            except Exception as exc:
+                print(f"Warning: Failed to load ONNX model at {target}: {exc}")
+
+        # 2. Legacy fallback only if specifically targeting an .h5 file
+        elif str(target).endswith(".h5"):
+            try:
+                import keras
+                _LOADED_MODEL = keras.models.load_model(str(target))
+                _IS_GENUINE_MODEL = True
+                print(f"✓ Trained Keras model loaded from {target}")
+                return _LOADED_MODEL
+            except Exception as exc:
+                print(f"Warning: Could not load Keras model at {target}: {exc}")
 
     _LOADED_MODEL = None
     _IS_GENUINE_MODEL = False
-    print("ℹ No trained ML model binary found. Food image inference will report 503 Service Unavailable.")
+    _MODEL_METADATA = {}
+    print(f"ℹ No trained ML model binary found at {target}. Food image inference will report 503 Service Unavailable.")
     return None
 
 
@@ -137,6 +221,12 @@ def is_model_loaded() -> bool:
     """Returns True if a genuine trained model is loaded."""
     global _IS_GENUINE_MODEL
     return _IS_GENUINE_MODEL
+
+
+def get_model_metadata() -> Dict[str, Any]:
+    """Returns validated model metadata."""
+    global _MODEL_METADATA
+    return _MODEL_METADATA
 
 
 def set_loaded_model_for_testing(model: Any):

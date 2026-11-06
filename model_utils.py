@@ -123,28 +123,68 @@ def download_model_if_needed(
 
 def validate_onnx_model(sess: Any, class_names_path: Optional[str] = None) -> Dict[str, Any]:
     """
-    Validates ONNX model input/output signature and cross-checks class_names.json dimensions.
+    Validates ONNX model input/output tensor signature against strict production requirements:
+    - Exactly 1 input tensor.
+    - Input tensor must be 4D (batch, height, width, channels) matching NHWC [batch, 224, 224, 3].
+    - Input data type must be tensor(float).
+    - Clear rejection for dynamic or unsupported spatial/channel dimensions.
+    - Exactly 1 output tensor.
+    - Output tensor must be float and match the number of classes defined in class_names.json (101).
     """
     inputs = sess.get_inputs()
     outputs = sess.get_outputs()
 
-    if not inputs or not outputs:
-        raise ValueError("ONNX model has invalid or empty inputs/outputs.")
+    if not inputs or len(inputs) != 1:
+        count = len(inputs) if inputs else 0
+        raise ValueError(f"ONNX model must have exactly 1 input tensor, got {count}.")
+
+    if not outputs or len(outputs) != 1:
+        count = len(outputs) if outputs else 0
+        raise ValueError(f"ONNX model must have exactly 1 output tensor, got {count}.")
 
     input_meta = inputs[0]
     output_meta = outputs[0]
 
-    # Validate shape dimensions: expects [batch, 224, 224, 3] or [batch, 3, 224, 224]
+    # Validate input data type
+    allowed_types = {"tensor(float)", "tensor(float32)", "float", "float32"}
+    if str(input_meta.type).lower() not in allowed_types:
+        raise ValueError(f"Unsupported ONNX input data type: {input_meta.type}. Expected float32/tensor(float).")
+
+    # Validate 4D rank
     in_shape = input_meta.shape
     if len(in_shape) != 4:
-        raise ValueError(f"Unexpected ONNX input rank: {in_shape}. Expected 4D tensor (NHWC or NCHW).")
+        raise ValueError(f"Unexpected ONNX input rank: {in_shape}. Expected 4D tensor (NHWC [batch, 224, 224, 3]).")
 
-    # Output dimensions check against class names
+    # Validate spatial & channel layout: NHWC [batch, 224, 224, 3]
+    # batch dimension in_shape[0] can be int or dynamic string/None
+    batch_dim, height_dim, width_dim, channels_dim = in_shape[0], in_shape[1], in_shape[2], in_shape[3]
+
+    if isinstance(batch_dim, int) and batch_dim <= 0:
+        raise ValueError(f"Invalid batch dimension: {batch_dim}.")
+
+    if height_dim != 224:
+        raise ValueError(f"Unsupported ONNX input height: {height_dim}. Expected 224.")
+
+    if width_dim != 224:
+        raise ValueError(f"Unsupported ONNX input width: {width_dim}. Expected 224.")
+
+    if channels_dim != 3:
+        raise ValueError(f"Unsupported ONNX input channels: {channels_dim}. Expected 3 (RGB).")
+
+    # Validate output tensor type
+    if str(output_meta.type).lower() not in allowed_types:
+        raise ValueError(f"Unsupported ONNX output data type: {output_meta.type}. Expected float32/tensor(float).")
+
     out_shape = output_meta.shape
-    num_classes = out_shape[-1] if len(out_shape) >= 2 else None
+    if len(out_shape) != 2:
+        raise ValueError(f"Unexpected ONNX output rank: {out_shape}. Expected 2D tensor [batch, num_classes].")
+
+    num_classes = out_shape[-1]
+    if not isinstance(num_classes, int) or num_classes <= 0:
+        raise ValueError(f"Invalid ONNX output class dimension: {num_classes}.")
 
     class_names = load_class_names(class_names_path)
-    if class_names and num_classes and isinstance(num_classes, int):
+    if class_names:
         if len(class_names) != num_classes:
             raise ValueError(
                 f"Class names count ({len(class_names)}) does not match ONNX output classes ({num_classes})."

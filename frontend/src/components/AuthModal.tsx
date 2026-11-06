@@ -21,9 +21,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({ onSuccess }) => {
     setMessage(null);
 
     if (!supabase) {
-      // Local Guest demo fallback
-      const demoUser = { id: 'demo_user_123', email: email || 'demo@nutrilens.local' };
-      onSuccess(demoUser, 'demo_token');
+      setLoading(false);
+      setMessage({
+        type: 'error',
+        text: 'Cloud authentication is not configured in this environment. Please use Guest Mode to explore the application locally.',
+      });
       return;
     }
 

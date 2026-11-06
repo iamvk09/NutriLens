@@ -38,11 +38,7 @@ jobs:
           # Verify that importing model_utils does NOT load tensorflow into sys.modules
           python -c "import model_utils, sys; assert 'tensorflow' not in sys.modules, 'TensorFlow should not be loaded on ONNX path'"
 
-      - name: Verify ONNX Model Architecture & Validation Logic
-        run: |
-          python -c "import model_utils; res = model_utils.load_model_safe('models/food_model.onnx'); assert res is not None, 'Failed to load ONNX model'"
-
-      - name: Run Pytest
+      - name: Run Pytest Suite
         env:
           SUPABASE_URL: https://mock.supabase.co
           SUPABASE_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U

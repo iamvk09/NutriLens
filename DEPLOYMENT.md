@@ -1,92 +1,80 @@
-# NutriLens Deployment Guide
+# NutriLens V2 Production Deployment Guide
 
-## 1. Prerequisites
-- Docker Engine 20.10+ & Docker Compose v2+
-- Supabase project credentials (URL, Anon Key, JWT Secret)
-- USDA FoodData Central API key ([fdc.nal.usda.gov](https://fdc.nal.usda.gov/api-guide.html))
-- Google Gemini API key (optional for AI Chef & Label OCR) ([aistudio.google.com](https://aistudio.google.com/))
-- (Optional) Trained Keras model binary `food_model.h5` placed in `models/`
+This guide details deployment of NutriLens V2 using **Cloudflare Pages** for the React frontend and **Render / Fly.io** for the FastAPI backend, connected to **Supabase** for PostgreSQL and Authentication.
 
 ---
 
-## 2. Environment Configuration
-Copy `.env.example` to `.env` and fill in credentials:
+## 1. Prerequisites & Environment Setup
 
-```bash
-cp .env.example .env
-```
-
-Ensure the following variables are specified:
-```env
-ENVIRONMENT=production
-LOG_LEVEL=INFO
-BACKEND_API_URL=http://localhost:8000/api/v1
-FRONTEND_APP_URL=http://localhost:8501
-CORS_ORIGINS=http://localhost:8501,http://127.0.0.1:8501
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your-anon-key
-SUPABASE_JWT_SECRET=your-supabase-jwt-secret
-USDA_API_KEY=your-usda-key
-GEMINI_API_KEY=your-gemini-key
-```
+Verify the following secrets from `.env.example`:
+1. `SUPABASE_URL` & `SUPABASE_KEY` (Anon public key)
+2. `SUPABASE_JWT_SECRET` (For server-side offline token authentication)
+3. `USDA_API_KEY` (From [FoodData Central](https://fdc.nal.usda.gov/api-guide.html))
+4. `GEMINI_API_KEY` (From [Google AI Studio](https://aistudio.google.com/))
 
 ---
 
-## 3. Database Setup (Supabase)
-Run the complete SQL migration in your Supabase SQL Editor:
-```bash
-# Execute statements from:
-db/schema.sql
-```
-This sets up tables (`logged_meals`, `meal_likes`, `shopping_list`, `chat_history`), indexes, Row Level Security (RLS) policies, and atomic RPC functions (`increment_meal_likes`, `get_top_loggers_last_7_days`).
+## 2. Frontend Deployment (Cloudflare Pages)
+
+1. Log into your [Cloudflare Dashboard](https://dash.cloudflare.com/) and navigate to **Workers & Pages** > **Create application** > **Pages** > **Connect to Git**.
+2. Select repository `iamvk09/NutriLens` and target branch `v2`.
+3. Set the build configuration:
+   - **Framework preset**: `Vite`
+   - **Root directory**: `frontend`
+   - **Build command**: `npm run build`
+   - **Build output directory**: `dist`
+4. Set Environment Variables:
+   - `VITE_BACKEND_API_URL`: Your deployed backend URL (e.g., `https://nutrilens-api.onrender.com/api/v1`)
+   - `VITE_SUPABASE_URL`: Your Supabase URL
+   - `VITE_SUPABASE_KEY`: Your Supabase anon key
+5. Click **Save and Deploy**. Cloudflare provisions automatic global CDN hosting and free HTTPS.
 
 ---
 
-## 4. Deployment Methods
+## 3. Backend Deployment (Render Free Web Service)
 
-### Option A: Docker Compose (Recommended for Multi-Service Orchestration)
-Build and run both backend and frontend in isolated containers:
-
-```bash
-docker compose up -d --build
-```
-
-Inspect service health:
-```bash
-docker compose ps
-docker compose logs -f
-```
-
-- Backend Healthcheck: `http://localhost:8000/health`
-- Frontend UI: `http://localhost:8501`
-- Interactive API Docs: `http://localhost:8000/docs`
-
-### Option B: Bare-Metal / Virtual Environment
-
-#### 1. Setup Environment & Dependencies
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-#### 2. Run Backend (FastAPI + Uvicorn)
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
-```
-
-#### 3. Run Frontend (Streamlit)
-```bash
-streamlit run streamlit_app.py --server.port 8501 --server.address 0.0.0.0
-```
+1. Log into your [Render Dashboard](https://dashboard.render.com/) and click **New** > **Web Service**.
+2. Connect your GitHub repository `iamvk09/NutriLens`, selecting branch `v2`.
+3. Specify configuration:
+   - **Runtime**: `Python 3` (or Docker via `Dockerfile.backend`)
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+   - **Plan**: `Free` (0.1 CPU, 512 MB RAM)
+4. Add Environment Variables:
+   - `ENVIRONMENT`: `production`
+   - `CORS_ORIGINS`: Your Cloudflare Pages URL (e.g. `https://nutrilens.pages.dev,http://localhost:3000`)
+   - `SUPABASE_URL`: Your Supabase project URL
+   - `SUPABASE_KEY`: Your Supabase anon key
+   - `SUPABASE_JWT_SECRET`: Your Supabase JWT secret
+   - `USDA_API_KEY`: Your USDA key
+   - `GEMINI_API_KEY`: Your Gemini key
+   - `MODEL_PATH`: `./models/food_model.onnx`
+5. Click **Create Web Service**.
 
 ---
 
-## 5. Production Health & Troubleshooting
+## 4. Local Development Run
 
-| Check | Command | Expected Output |
-|---|---|---|
-| API Health | `curl -f http://localhost:8000/health` | `{"status":"healthy","model_loaded":true,...}` |
-| Frontend Health | `curl -f http://localhost:8501/_stcore/health` | `ok` |
-| Container Logs | `docker compose logs -f backend` | Structured JSON or formatted logs |
-| Database Connectivity | Verified in `/health` output | `"supabase_configured":true` |
+### Run Backend
+```bash
+python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Run Frontend
+```bash
+cd frontend
+npm install
+npm run dev
+```
+Open [http://localhost:3000](http://localhost:3000) in your browser.
+
+---
+
+## 5. Rollback Procedure
+If a regression occurs, redeploy the previous commit on branch `v2`:
+```bash
+git checkout v2
+git revert HEAD
+git push origin v2
+```
+Cloudflare Pages and Render will automatically build the reverted release.

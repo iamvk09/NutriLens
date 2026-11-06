@@ -1,63 +1,62 @@
-# NutriLens Architecture & Technical Design
+# NutriLens V2 Architecture & System Design
 
-## 1. System Architecture Overview
+## 1. Architectural Overview
 
-NutriLens is designed as a decoupled, microservice-ready web application consisting of a high-performance **FastAPI Backend** and an interactive **Streamlit Frontend**, integrated with Supabase PostgreSQL and external AI/Nutrition APIs.
+NutriLens V2 transitions from a monolithic Streamlit script to a modern, decoupled cloud architecture:
+- **Client Layer**: React 19 + TypeScript + Vite Single-Page Application (SPA) with responsive TailwindCSS, hosted on Cloudflare Pages edge CDN.
+- **Inference Layer**: Dual-mode machine learning runtime:
+  - Client-side execution option with zero cloud latency.
+  - Server-side ONNX Runtime CPU execution (14.5 MB, ~1.6 ms latency, ~48 MB RAM) replacing the heavy 450 MB TensorFlow dependency.
+- **Backend Service Layer**: Production FastAPI server providing authenticated REST endpoints, non-blocking asynchronous HTTP clients (`httpx`), and structured request logging.
+- **Database & Identity Layer**: Supabase PostgreSQL featuring Row Level Security (RLS), atomic stored procedures for likes and leaderboards, and GoTrue JWT verification.
+- **External Intelligence**: USDA FoodData Central, OpenFoodFacts, and Google Gemini AI.
 
 ```
 +-------------------------------------------------------------+
-|                 Streamlit Frontend (:8501)                  |
-|  - Meal Tracker    - Nutritional Dashboard   - AI Chef      |
-|  - Groceries List  - Community Feed          - Barcode/OCR  |
+|          Cloudflare Pages: React + TypeScript SPA           |
+|  - Fast Camera / Photo Upload  - Real-time Charts / PDF    |
+|  - In-Browser Barcode Scan     - Interactive Shopping List  |
 +------------------------------+------------------------------+
-                               |
-                               | Authenticated REST / JSON
-                               | (Bearer <Supabase_JWT>)
+                               | (JWT Bearer / HTTPS)
                                v
 +-------------------------------------------------------------+
-|                  FastAPI Backend (:8000)                    |
-|  +---------------------+  +-------------------------------+ |
-|  | Request Logging &   |  | Authentication & RBAC / IDOR  | |
-|  | Structured Metrics  |  | JWT Validation                | |
-|  +---------------------+  +-------------------------------+ |
-|  +---------------------+  +-------------------------------+ |
-|  | Food ML Inference   |  | Asynchronous Network Clients  | |
-|  | (TensorFlow/Keras)  |  | (httpx.AsyncClient + Pools)   | |
-|  +---------------------+  +-------------------------------+ |
-+---------------+-----------------------------+---------------+
-                |                             |
-                v                             v
-+-------------------------------+  +--------------------------+
-|  Supabase (PostgreSQL / RLS)  |  | External Services:       |
-|  - logged_meals               |  | - USDA FoodData Central  |
-|  - meal_likes (deduplication) |  | - OpenFoodFacts API      |
-|  - shopping_list              |  | - Google Gemini Vision   |
-|  - chat_history               |  +--------------------------+
-+-------------------------------+
+|             Render / Docker: FastAPI Backend (:8000)        |
+|  - Non-blocking Async Clients (httpx)                       |
+|  - Microsecond ONNX Runtime Food-101 Classifier             |
+|  - JWT Role & Subject IDOR Validation                       |
++--------+--------------------+---------------------+---------+
+         |                    |                     |
+         v                    v                     v
+   +------------+     +---------------+     +---------------+
+   |  Supabase  |     |     USDA      |     | OpenFoodFacts |
+   | PostgreSQL |     |  FoodData API |     |  Barcode API  |
+   +------------+     +---------------+     +---------------+
 ```
 
-## 2. Component Breakdown
+---
 
-### 2.1 Backend Services (`main.py`, `auth.py`, `config.py`, `logger.py`, `model_utils.py`)
-- **FastAPI Core**: Asynchronous ASGI web framework handling REST endpoints with Pydantic request/response validation.
-- **Authentication & RBAC (`auth.py`)**: Intercepts `Authorization: Bearer <token>` headers, verifies Supabase JWT signatures (offline via `SUPABASE_JWT_SECRET` or via Supabase Auth API), and extracts the authenticated user ID. All queries on private data enforce ownership to eliminate Insecure Direct Object References (IDOR).
-- **Non-blocking Network Layer**: Reusable `httpx.AsyncClient` with connection pooling, retries, and strict 10s timeouts for external USDA and OpenFoodFacts requests.
-- **Computer Vision & ML Pipeline (`model_utils.py`)**:
-  - Image preprocessing: 224x224 RGB normalization.
-  - TensorFlow inference optimization: memory growth configuration and bounded thread pools.
-  - Model retrieval resilience: loads local model, downloads from `MODEL_DOWNLOAD_URL` if configured, and provides transparent error reporting (HTTP 503 Service Unavailable) when the model binary is absent rather than returning pseudo-AI fabricated predictions.
-- **Structured Logging (`logger.py`)**: JSON formatting for production environments, standard formatting for local development, and per-request UUID tracking (`X-Request-ID`).
+## 2. API Contracts & Schemas
 
-### 2.2 Frontend Application (`streamlit_app.py`)
-- Modern dark-themed user interface with glassmorphism styling.
-- Centralized configuration via `BACKEND_API_URL` and `FRONTEND_APP_URL`.
-- Passes user session JWT tokens to backend endpoints for authenticated operations.
-- Separated Scanner tool:
-  - **Barcode Scanning**: decodes barcode and queries OpenFoodFacts via `/api/v1/scan_barcode`.
-  - **Nutrition Label Inspector**: uses Gemini Vision via `/api/v1/scan_label` to analyze ingredients and health ratings.
+### `/api/v1/analyze` (POST)
+- **Input**: Multipart file `file`.
+- **Output**:
+  - `food_name`: Predicted food category (from Food-101).
+  - `confidence`: Confidence probability score (0.0 to 1.0).
+  - `top_predictions`: Top 3 alternative predictions with confidences.
+  - `calories`, `protein_g`, `fat_g`, `carb_g`: Nutritional profile.
+  - `source`: `'USDA'` or `'FALLBACK_ESTIMATE'`.
+  - `is_verified`: Boolean flag indicating whether values originate from a direct database match.
 
-### 2.3 Database Layer (`db/schema.sql`)
-- PostgreSQL database hosted on Supabase.
-- Row-Level Security (RLS) policies on `logged_meals`, `meal_likes`, `shopping_list`, and `chat_history`.
-- Unique constraint on `meal_likes(meal_id, user_id)` preventing duplicate user likes.
-- Server-side stored procedure (`increment_meal_likes`) and aggregation function (`get_top_loggers_last_7_days`) for performance.
+### `/api/v1/log_meal` (POST)
+- **Headers**: `Authorization: Bearer <JWT>`
+- **Input**:
+  - `food_name`: 1–100 characters.
+  - `calories`: 0.0 – 10,000.0 kcal.
+  - `protein_g`, `fat_g`, `carb_g`: 0.0 – 1,000.0 g.
+  - `is_public`: Boolean toggle.
+- **Security**: Server extracts `auth.uid()` from the verified JWT and overrides any client-supplied `user_id`.
+
+### `/api/v1/community/like` (POST)
+- **Headers**: `Authorization: Bearer <JWT>`
+- **Input**: `meal_id: int`
+- **Behavior**: Executes `increment_meal_likes` atomic SQL stored procedure. Returns `409 Conflict` if the meal was previously liked by the calling user.

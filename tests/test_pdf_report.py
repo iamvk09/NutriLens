@@ -11,7 +11,7 @@ import pytest
 
 # Setup minimal env vars before importing streamlit_app
 os.environ["SUPABASE_URL"] = "https://mock.supabase.co"
-os.environ["SUPABASE_KEY"] = "mock_key"
+os.environ["SUPABASE_KEY"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
 os.environ["GEMINI_API_KEY"] = "mock_gemini"
 
 from streamlit_app import generate_pdf_report

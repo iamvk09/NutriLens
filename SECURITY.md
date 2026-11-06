@@ -1,31 +1,22 @@
-# NutriLens Security Policy & Hardening Guide
+# NutriLens Security Model & Hardening Specifications
 
-## 1. Security Architecture & Threat Model
+## 1. Authentication & Authorization Controls
 
-NutriLens implements defense-in-depth principles across all application layers to safeguard sensitive dietary data, user sessions, and external API integrations.
+- **Cryptographic JWT Verification**: Tokens issued by Supabase GoTrue Auth are verified using `pyjwt` with HMAC-SHA256 and public keys.
+- **IDOR Safeguards**: Endpoints enforcing user identity (e.g. `/api/v1/history/{user_id}` and `/api/v1/log_meal`) bind database operations to `current_user.user_id` extracted from the cryptographically validated token, rejecting spoofed identities.
+- **Row Level Security (RLS)**: Enforced directly at the PostgreSQL layer. `auth.uid()::text = user_id` ensures that even direct database queries cannot read or mutate other users' private meals or groceries.
+- **Atomic Operations**: Like counter increments are guarded inside a single transactional stored procedure (`increment_meal_likes`) with unique constraints `(meal_id, user_id)` to eliminate race condition vulnerabilities.
 
-### Key Protections
-- **Supabase JWT Authentication**: Every mutation (`/log_meal`, `/community/like`) and private resource access (`/history/{user_id}`) requires a signed JSON Web Token issued by Supabase Auth.
-- **Strict IDOR Mitigation**: Users can only query and write records belonging to their authenticated identity (`current_user.user_id == user_id`). Unauthenticated or mismatched requests receive `401 Unauthorized` or `403 Forbidden`.
-- **CORS Origin Whitelisting**: `main.py` restricts cross-origin resource sharing to explicitly allowed origins specified in `CORS_ORIGINS` (e.g. `http://localhost:8501`). Wildcard `*` origins with credentials have been eradicated.
-- **Duplicate Like & Race Condition Prevention**: `meal_likes` table maintains a database-level `UNIQUE (meal_id, user_id)` constraint, preventing concurrent race conditions and multiple likes from the same account.
-- **Upload Validation & DoS Protection**: Image uploads are constrained to `MAX_IMAGE_SIZE_BYTES` (default 10 MB) with header verification and PIL image decoding integrity checks.
-- **Error Masking & Information Leakage Prevention**: Production logs capture full stack traces internally while sanitizing public error responses to generic user-safe error messages.
-- **Zero Secrets in Code**: All API keys, secrets, and database credentials are fully decoupled from git and managed through `.env` and environment variables.
+---
 
-## 2. Row Level Security (RLS)
+## 2. Input Validation & Defense-in-Depth
 
-All Supabase PostgreSQL tables must have Row Level Security enabled:
+- **Pydantic Validation**: Strict numeric boundaries on all food payloads (`calories` <= 10,000, `macros` <= 1,000g, non-empty stripped strings).
+- **File Upload Limits**: Enforces a strict 10 MB maximum request payload limit and PIL header verification (`image.verify()`) to thwart image decompression bombs or arbitrary binary execution.
+- **CORS Protection**: Restricted to whitelist domains configured in `CORS_ORIGINS`.
 
-```sql
-ALTER TABLE logged_meals ENABLE ROW LEVEL SECURITY;
-ALTER TABLE meal_likes ENABLE ROW LEVEL SECURITY;
-ALTER TABLE shopping_list ENABLE ROW LEVEL SECURITY;
-ALTER TABLE chat_history ENABLE ROW LEVEL SECURITY;
-```
+---
 
-Policies defined in `db/schema.sql` restrict writes and reads to matching `auth.uid()`, guaranteeing that users cannot tamper with or inspect meals belonging to other individuals.
-
-## 3. Reporting Vulnerabilities
-
-If you identify a security vulnerability in NutriLens, please do not open a public issue. Email security reports directly to `security@nutrilens.dev` with replication details and affected endpoints.
+## 3. Secret Management
+- **Zero Secrets in Repository**: `.env` is ignored by `.gitignore`. Template credentials and placeholder configurations are placed in `.env.example`.
+- **Runtime Environment Isolation**: In cloud deployment, API keys and database secrets are injected via platform environment secrets (Cloudflare Pages Secrets & Render Environment Variables).

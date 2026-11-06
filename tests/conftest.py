@@ -191,11 +191,19 @@ class DummyMockModel:
     """Mock ML model for testing inference endpoints."""
     def predict_on_batch(self, image_array):
         probs = np.zeros((1, 5), dtype=np.float32)
-        probs[0, 0] = 1.0  # Class 0: apple
+        probs[0, 0] = 0.95  # Class 0: apple
         return probs
 
     def predict(self, image_array, verbose=0):
         return self.predict_on_batch(image_array)
+
+    def get_inputs(self):
+        class DummyInput:
+            name = "input_layer"
+        return [DummyInput()]
+
+    def run(self, out_names, input_feed):
+        return [self.predict_on_batch(list(input_feed.values())[0])]
 
 
 @pytest.fixture

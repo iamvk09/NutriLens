@@ -86,22 +86,34 @@ def download_model_if_needed(model_path: str, download_url: Optional[str]) -> bo
         return False
 
 
-def load_model_safe(model_path: str = "./models/food_model.h5", download_url: Optional[str] = None):
+def load_model_safe(model_path: str = "./models/food_model.onnx", download_url: Optional[str] = None):
     """
-    Safely loads the genuine Keras model.
+    Safely loads the genuine model (preferring fast ONNX Runtime, with Keras fallback).
     Does NOT fabricate pseudo-AI predictions when the binary is absent.
     Sets _IS_GENUINE_MODEL=True if successfully loaded.
     """
     global _LOADED_MODEL, _IS_GENUINE_MODEL
     configure_tensorflow_runtime()
 
+    # Check for ONNX first
+    onnx_path = Path("./models/food_model.onnx")
+    if onnx_path.exists() and onnx_path.stat().st_size > 0:
+        try:
+            import onnxruntime as ort
+            sess = ort.InferenceSession(str(onnx_path))
+            _LOADED_MODEL = sess
+            _IS_GENUINE_MODEL = True
+            print(f"✓ High-performance ONNX model loaded successfully from {onnx_path}")
+            return _LOADED_MODEL
+        except Exception as exc:
+            print(f"Warning: Could not load ONNX model at {onnx_path}: {exc}")
+
     download_model_if_needed(model_path, download_url)
 
     target = Path(model_path)
     if target.exists() and target.stat().st_size > 0:
         try:
-            import tensorflow as tf
-            from tensorflow import keras
+            import keras
             _LOADED_MODEL = keras.models.load_model(str(target))
             _IS_GENUINE_MODEL = True
             print(f"✓ Trained Keras model loaded successfully from {target}")
@@ -134,15 +146,25 @@ def set_loaded_model_for_testing(model: Any):
     _IS_GENUINE_MODEL = model is not None
 
 
-def predict_food_name(model: Any, image_array: np.ndarray, class_names: Optional[Dict[int, str]] = None) -> str:
+def predict_food_name(
+    model: Any,
+    image_array: np.ndarray,
+    class_names: Optional[Dict[int, str]] = None,
+    top_k: int = 3
+) -> Dict[str, Any]:
     """
-    Inference pipeline for a loaded Keras or compatible model.
+    Inference pipeline for a loaded ONNX session, Keras, or compatible model.
+    Returns primary food name, confidence score, and top-k alternative predictions.
     """
     if model is None:
         raise RuntimeError("No model loaded for prediction")
 
     try:
-        if hasattr(model, "predict_on_batch"):
+        # Check if ONNX InferenceSession
+        if hasattr(model, "get_inputs") and hasattr(model, "run"):
+            input_name = model.get_inputs()[0].name
+            predictions = model.run(None, {input_name: image_array})[0]
+        elif hasattr(model, "predict_on_batch"):
             predictions = model.predict_on_batch(image_array)
         else:
             predictions = model.predict(image_array, verbose=0)
@@ -156,19 +178,41 @@ def predict_food_name(model: Any, image_array: np.ndarray, class_names: Optional
             pred = pred.numpy()
 
         if isinstance(pred, (str, bytes)):
-            return str(pred)
+            return {
+                "food_name": str(pred),
+                "confidence": 1.0,
+                "top_predictions": [{"food_name": str(pred), "confidence": 1.0}]
+            }
 
         if len(getattr(pred, "shape", [])) >= 1:
-            predicted_class_idx = int(np.argmax(pred))
-            if class_names and predicted_class_idx in class_names:
-                return class_names[predicted_class_idx]
-            return f"food_item_{predicted_class_idx}"
+            # Softmax array of probabilities
+            probabilities = np.array(pred, dtype=np.float32)
+            predicted_class_idx = int(np.argmax(probabilities))
+            confidence = float(probabilities[predicted_class_idx])
+
+            # Top-k extraction
+            sorted_indices = np.argsort(probabilities)[::-1][:top_k]
+            top_preds = []
+            for idx in sorted_indices:
+                c_idx = int(idx)
+                name = class_names[c_idx] if (class_names and c_idx in class_names) else f"food_item_{c_idx}"
+                top_preds.append({"food_name": name, "confidence": float(round(probabilities[c_idx], 4))})
+
+            food_name = top_preds[0]["food_name"]
+            return {
+                "food_name": food_name,
+                "confidence": round(confidence, 4),
+                "top_predictions": top_preds
+            }
 
         if isinstance(pred, (int, np.integer)):
             idx = int(pred)
-            if class_names and idx in class_names:
-                return class_names[idx]
-            return f"food_item_{idx}"
+            food_name = class_names[idx] if (class_names and idx in class_names) else f"food_item_{idx}"
+            return {
+                "food_name": food_name,
+                "confidence": 1.0,
+                "top_predictions": [{"food_name": food_name, "confidence": 1.0}]
+            }
 
         raise RuntimeError("Unrecognized model prediction structure")
     except Exception as exc:

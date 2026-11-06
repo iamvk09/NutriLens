@@ -2,26 +2,34 @@
 Pydantic schemas for request/response validation
 """
 
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, field_validator
 
 
 class AnalyzeResponse(BaseModel):
     """Response schema for /api/v1/analyze endpoint"""
     food_name: str = Field(..., description="Name of the predicted food item")
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Model prediction confidence (0-1)")
+    top_predictions: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="Top-k alternative predictions with confidences")
     calories: float = Field(..., ge=0, description="Calories in kcal")
     protein_g: float = Field(..., ge=0, description="Protein content in grams")
     fat_g: float = Field(..., ge=0, description="Total fat content in grams")
     carb_g: float = Field(..., ge=0, description="Carbohydrate content in grams")
+    source: str = Field(default="USDA", description="Source of nutrition metrics (USDA, OFF, or FALLBACK_ESTIMATE)")
+    is_verified: bool = Field(default=True, description="Whether data is direct from verified database")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "food_name": "apple",
+                "confidence": 0.94,
+                "top_predictions": [{"food_name": "apple", "confidence": 0.94}],
                 "calories": 52.0,
                 "protein_g": 0.3,
                 "fat_g": 0.2,
-                "carb_g": 14.0
+                "carb_g": 14.0,
+                "source": "USDA",
+                "is_verified": True
             }
         }
 

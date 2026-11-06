@@ -299,16 +299,30 @@ async def analyze_food_image(
 
     image_array = preprocess_image(image_bytes)
     class_names = get_class_names()
-    predicted_food_name = predict_food_name_util(model, image_array, class_names)
+    prediction_result = predict_food_name_util(model, image_array, class_names)
+
+    if isinstance(prediction_result, dict):
+        predicted_food_name = prediction_result["food_name"]
+        confidence = prediction_result.get("confidence")
+        top_predictions = prediction_result.get("top_predictions", [])
+    else:
+        predicted_food_name = str(prediction_result)
+        confidence = 1.0
+        top_predictions = [{"food_name": predicted_food_name, "confidence": 1.0}]
 
     nutrition_data = await fetch_usda_nutrition(predicted_food_name, http_client)
+    source = "USDA" if settings.USDA_API_KEY else "FALLBACK_ESTIMATE"
 
     return AnalyzeResponse(
         food_name=predicted_food_name,
+        confidence=confidence,
+        top_predictions=top_predictions,
         calories=nutrition_data["calories"],
         protein_g=nutrition_data["protein_g"],
         fat_g=nutrition_data["fat_g"],
-        carb_g=nutrition_data["carb_g"]
+        carb_g=nutrition_data["carb_g"],
+        source=source,
+        is_verified=bool(settings.USDA_API_KEY)
     )
 
 

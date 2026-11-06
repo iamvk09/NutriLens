@@ -26,8 +26,11 @@ def test_predict_food_name_with_mapping():
     model = DummyModel()
     classes = {0: "apple", 1: "banana", 2: "pizza", 3: "salad", 4: "sandwich"}
     arr = np.zeros((1, 224, 224, 3), dtype=np.float32)
-    name = predict_food_name(model, arr, classes)
-    assert name == "pizza"
+    res = predict_food_name(model, arr, classes)
+    assert (res["food_name"] if isinstance(res, dict) else res) == "pizza"
+    if isinstance(res, dict):
+        assert res["confidence"] == 1.0
+        assert len(res["top_predictions"]) >= 1
 
 
 def test_predict_food_name_none_raises():

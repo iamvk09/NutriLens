@@ -15,8 +15,12 @@ from model_utils import (
     load_model_safe,
 )
 from schemas import LogMealRequest, LikeRequest, AnalyzeResponse
+from main import preprocess_image
+from fastapi import HTTPException
 import os
+import io
 from pathlib import Path
+from PIL import Image
 
 
 class MockTensorMeta:
@@ -124,6 +128,118 @@ def test_validate_onnx_model_mismatched_class_count():
     ])
     with pytest.raises(ValueError, match="does not match ONNX output classes"):
         validate_onnx_model(sess, class_names_path="models/class_names.json")
+
+
+def test_validate_onnx_model_batch_mismatch():
+    """Verifies that statically determinable batch mismatch between input and output is rejected."""
+    sess = MockONNXSession(
+        inputs=[MockTensorMeta("input_layer", [1, 224, 224, 3], "tensor(float)")],
+        outputs=[MockTensorMeta("output_0", [2, 101], "tensor(float)")]
+    )
+    with pytest.raises(ValueError, match="Input batch dimension .* does not match output batch dimension"):
+        validate_onnx_model(sess, class_names_path="models/class_names.json")
+
+
+def test_class_names_mandatory_missing(tmp_path):
+    """Verifies FileNotFoundError when class mapping file does not exist."""
+    missing_file = tmp_path / "nonexistent_class_names.json"
+    with pytest.raises(FileNotFoundError, match="Mandatory class names file not found"):
+        load_class_names(str(missing_file))
+
+
+def test_class_names_mandatory_empty(tmp_path):
+    """Verifies ValueError when class mapping file is 0 bytes or empty JSON array/dict."""
+    empty_file = tmp_path / "empty_class_names.json"
+    empty_file.write_text("")
+    with pytest.raises(ValueError, match="Class names file is empty"):
+        load_class_names(str(empty_file))
+
+    empty_list_file = tmp_path / "empty_list.json"
+    empty_list_file.write_text("[]")
+    with pytest.raises(ValueError, match="Class names list is empty"):
+        load_class_names(str(empty_list_file))
+
+    empty_dict_file = tmp_path / "empty_dict.json"
+    empty_dict_file.write_text("{}")
+    with pytest.raises(ValueError, match="Class names mapping is empty"):
+        load_class_names(str(empty_dict_file))
+
+
+def test_class_names_mandatory_malformed(tmp_path):
+    """Verifies ValueError when class mapping file is malformed JSON."""
+    malformed_file = tmp_path / "malformed.json"
+    malformed_file.write_text("{broken_json: true,")
+    with pytest.raises(ValueError, match="Failed to parse class names"):
+        load_class_names(str(malformed_file))
+
+
+def test_predict_food_name_missing_class_names_fails():
+    """Verifies predict_food_name fails when class_names is None or empty."""
+    sess = MockONNXSession()
+    dummy_input = np.zeros((1, 224, 224, 3), dtype=np.float32)
+    with pytest.raises(ValueError, match="Mandatory class_names mapping must be provided"):
+        predict_food_name(sess, dummy_input, class_names=None)
+    with pytest.raises(ValueError, match="Mandatory class_names mapping must be provided"):
+        predict_food_name(sess, dummy_input, class_names={})
+
+
+def test_production_preprocess_image_actual_implementation():
+    """
+    Tests the actual preprocess_image() function used in production inference:
+    - RGB conversion from grayscale/RGBA
+    - Resize to 224x224
+    - Batch dimension addition (1, 224, 224, 3)
+    - float32 dtype
+    - Normalization to [0.0, 1.0]
+    """
+    # Create an arbitrary non-square RGBA image (e.g. 100x300)
+    img = Image.new("RGBA", (100, 300), color=(128, 64, 32, 255))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    raw_bytes = buf.getvalue()
+
+    # Pass directly through the production preprocess_image function
+    result = preprocess_image(raw_bytes)
+
+    assert isinstance(result, np.ndarray)
+    assert result.shape == (1, 224, 224, 3), f"Expected (1, 224, 224, 3), got {result.shape}"
+    assert result.dtype == np.float32, f"Expected float32, got {result.dtype}"
+    assert 0.0 <= result.min() <= result.max() <= 1.0
+    # Expected RGB values normalized (128/255, 64/255, 32/255)
+    assert pytest.approx(result[0, 0, 0, 0], rel=1e-2) == 128.0 / 255.0
+    assert pytest.approx(result[0, 0, 0, 1], rel=1e-2) == 64.0 / 255.0
+    assert pytest.approx(result[0, 0, 0, 2], rel=1e-2) == 32.0 / 255.0
+
+
+def test_production_preprocess_image_grayscale_to_rgb():
+    """Verifies that 1-channel grayscale images are converted into 3-channel RGB."""
+    gray_img = Image.new("L", (50, 50), color=200)
+    buf = io.BytesIO()
+    gray_img.save(buf, format="JPEG")
+    raw_bytes = buf.getvalue()
+
+    result = preprocess_image(raw_bytes)
+    assert result.shape == (1, 224, 224, 3)
+    assert result.dtype == np.float32
+    # Check that all 3 RGB channels have equal intensity
+    assert pytest.approx(result[0, 10, 10, 0], rel=1e-2) == 200.0 / 255.0
+    assert pytest.approx(result[0, 10, 10, 1], rel=1e-2) == 200.0 / 255.0
+    assert pytest.approx(result[0, 10, 10, 2], rel=1e-2) == 200.0 / 255.0
+
+
+def test_production_preprocess_image_invalid_bytes():
+    """Verifies that invalid or corrupted image bytes raise HTTPException(400)."""
+    corrupted_bytes = b"not_an_image_file_just_random_noise_1234567890"
+    with pytest.raises(HTTPException) as exc_info:
+        preprocess_image(corrupted_bytes)
+    assert exc_info.value.status_code == 400
+
+
+def test_production_preprocess_image_empty_bytes():
+    """Verifies that empty bytes raise HTTPException(400)."""
+    with pytest.raises(HTTPException) as exc_info:
+        preprocess_image(b"")
+    assert exc_info.value.status_code == 400
 
 
 def test_onnx_inference_preprocessing_pipeline_contract():

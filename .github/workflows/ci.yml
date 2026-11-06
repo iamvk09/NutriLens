@@ -49,7 +49,7 @@ jobs:
           pytest -v
 
   frontend-build:
-    name: Frontend Build, Lint & Typecheck
+    name: Frontend Build & Typecheck
     runs-on: ubuntu-latest
 
     defaults:

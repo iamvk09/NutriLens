@@ -43,35 +43,44 @@ def verify_file_checksum(filepath: Path, expected_sha256: Optional[str], expecte
     return True
 
 
-def load_class_names(class_names_path: Optional[str] = None) -> Optional[Dict[int, str]]:
-    """Loads class name mapping from JSON file."""
+def load_class_names(class_names_path: Optional[str] = None) -> Dict[int, str]:
+    """
+    Loads mandatory class name mapping from JSON file.
+    Raises ValueError or FileNotFoundError if the file is missing, empty, or malformed.
+    """
     if class_names_path is None:
         class_names_path = "./models/class_names.json"
 
     path = Path(class_names_path)
     if not path.exists():
-        return None
+        raise FileNotFoundError(f"Mandatory class names file not found: {class_names_path}")
 
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            content = f.read().strip()
+            if not content:
+                raise ValueError(f"Class names file is empty: {class_names_path}")
+            data = json.loads(content)
+
         if isinstance(data, list):
-            return {i: name for i, name in enumerate(data)}
-        if isinstance(data, dict):
-            return {int(k): v for k, v in data.items()}
-        return None
-    except Exception as e:
-        print(f"Warning: Failed to parse class names from {class_names_path}: {e}")
-        return None
+            if len(data) == 0:
+                raise ValueError(f"Class names list is empty in {class_names_path}")
+            return {i: str(name) for i, name in enumerate(data)}
+        elif isinstance(data, dict):
+            if len(data) == 0:
+                raise ValueError(f"Class names mapping is empty in {class_names_path}")
+            return {int(k): str(v) for k, v in data.items()}
+        else:
+            raise ValueError(f"Invalid format in class names file {class_names_path}: expected JSON list or dict.")
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ValueError(f"Failed to parse class names from {class_names_path}: {e}") from e
 
 
-def get_class_names() -> Dict[int, str]:
-    """Retrieves or lazily loads class names cache with sensible default."""
+def get_class_names(class_names_path: Optional[str] = None) -> Dict[int, str]:
+    """Retrieves or lazily loads mandatory class names cache."""
     global _CLASS_NAMES
-    if _CLASS_NAMES is None:
-        _CLASS_NAMES = load_class_names()
-    if not _CLASS_NAMES:
-        _CLASS_NAMES = {0: "apple", 1: "banana", 2: "pizza", 3: "salad", 4: "sandwich"}
+    if _CLASS_NAMES is None or class_names_path is not None:
+        _CLASS_NAMES = load_class_names(class_names_path)
     return _CLASS_NAMES
 
 
@@ -179,16 +188,21 @@ def validate_onnx_model(sess: Any, class_names_path: Optional[str] = None) -> Di
     if len(out_shape) != 2:
         raise ValueError(f"Unexpected ONNX output rank: {out_shape}. Expected 2D tensor [batch, num_classes].")
 
+    # Output batch compatibility with input batch dimensions wherever statically determinable
+    out_batch = out_shape[0]
+    if isinstance(batch_dim, int) and isinstance(out_batch, int) and batch_dim != out_batch:
+        raise ValueError(f"Input batch dimension ({batch_dim}) does not match output batch dimension ({out_batch}).")
+
     num_classes = out_shape[-1]
     if not isinstance(num_classes, int) or num_classes <= 0:
         raise ValueError(f"Invalid ONNX output class dimension: {num_classes}.")
 
+    # Mandatory class mapping validation
     class_names = load_class_names(class_names_path)
-    if class_names:
-        if len(class_names) != num_classes:
-            raise ValueError(
-                f"Class names count ({len(class_names)}) does not match ONNX output classes ({num_classes})."
-            )
+    if len(class_names) != num_classes:
+        raise ValueError(
+            f"Mandatory class names count ({len(class_names)}) does not match ONNX output classes ({num_classes})."
+        )
 
     return {
         "input_name": input_meta.name,
@@ -289,6 +303,9 @@ def predict_food_name(
     if model is None:
         raise RuntimeError("No model loaded for prediction")
 
+    if not class_names:
+        raise ValueError("Mandatory class_names mapping must be provided for production inference.")
+
     try:
         # Check if ONNX InferenceSession
         if hasattr(model, "get_inputs") and hasattr(model, "run"):
@@ -325,7 +342,9 @@ def predict_food_name(
             top_preds = []
             for idx in sorted_indices:
                 c_idx = int(idx)
-                name = class_names[c_idx] if (class_names and c_idx in class_names) else f"food_item_{c_idx}"
+                if c_idx not in class_names:
+                    raise KeyError(f"Predicted class index {c_idx} not found in mandatory class mapping.")
+                name = class_names[c_idx]
                 top_preds.append({"food_name": name, "confidence": float(round(probabilities[c_idx], 4))})
 
             food_name = top_preds[0]["food_name"]
@@ -337,7 +356,9 @@ def predict_food_name(
 
         if isinstance(pred, (int, np.integer)):
             idx = int(pred)
-            food_name = class_names[idx] if (class_names and idx in class_names) else f"food_item_{idx}"
+            if idx not in class_names:
+                raise KeyError(f"Predicted class index {idx} not found in mandatory class mapping.")
+            food_name = class_names[idx]
             return {
                 "food_name": food_name,
                 "confidence": 1.0,

@@ -1,135 +1,175 @@
 """
-Utility functions for ML model prediction and class name mapping.
+NutriLens Machine Learning Utilities
+Provides model loading, automated retrieval, inference optimization,
+and class mapping for food recognition.
 """
 
 import json
+import os
+import urllib.request
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, Any
 import numpy as np
-import tensorflow as tf
-from tensorflow import keras
+
+# Global references
+_LOADED_MODEL: Any = None
+_CLASS_NAMES: Optional[Dict[int, str]] = None
+_IS_GENUINE_MODEL: bool = False
+
+
+def configure_tensorflow_runtime():
+    """Configures TensorFlow memory growth and threading if TensorFlow is present."""
+    try:
+        import tensorflow as tf
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus:
+            for gpu in gpus:
+                try:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                except Exception:
+                    pass
+        tf.config.threading.set_inter_op_parallelism_threads(2)
+        tf.config.threading.set_intra_op_parallelism_threads(4)
+    except Exception:
+        pass
 
 
 def load_class_names(class_names_path: Optional[str] = None) -> Optional[Dict[int, str]]:
-    """
-    Load class name mapping from a JSON file.
-    
-    Expected JSON format:
-    {
-        "0": "apple",
-        "1": "banana",
-        ...
-    }
-    or
-    [
-        "apple",
-        "banana",
-        ...
-    ]
-    
-    Args:
-        class_names_path: Path to JSON file with class names. If None, checks './models/class_names.json'
-    
-    Returns:
-        Dictionary mapping class indices to food names, or None if file not found
-    """
+    """Loads class name mapping from JSON file."""
     if class_names_path is None:
         class_names_path = "./models/class_names.json"
-    
+
     path = Path(class_names_path)
     if not path.exists():
         return None
-    
+
     try:
-        with open(path, 'r') as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        
-        # Handle list format
         if isinstance(data, list):
             return {i: name for i, name in enumerate(data)}
-        
-        # Handle dict format
         if isinstance(data, dict):
             return {int(k): v for k, v in data.items()}
-        
         return None
     except Exception as e:
-        print(f"Warning: Failed to load class names from {class_names_path}: {e}")
+        print(f"Warning: Failed to parse class names from {class_names_path}: {e}")
         return None
 
 
-def predict_food_name(model: keras.Model, image_array: np.ndarray, 
-                     class_names: Optional[Dict[int, str]] = None) -> str:
-    """
-    Predict food name from preprocessed image array.
-    
-    This function handles different model output formats:
-    1. Classification model with class probabilities -> maps to class names
-    2. Model with text output -> extracts text directly
-    3. Model with custom output format -> returns index-based name
-    
-    Args:
-        model: Loaded Keras model
-        image_array: Preprocessed image array (shape: [1, 224, 224, 3])
-        class_names: Optional dictionary mapping class indices to food names
-    
-    Returns:
-        Predicted food name as string
-    """
+def get_class_names() -> Dict[int, str]:
+    """Retrieves or lazily loads class names cache with sensible default."""
+    global _CLASS_NAMES
+    if _CLASS_NAMES is None:
+        _CLASS_NAMES = load_class_names()
+    if not _CLASS_NAMES:
+        _CLASS_NAMES = {0: "apple", 1: "banana", 2: "pizza", 3: "salad", 4: "sandwich"}
+    return _CLASS_NAMES
+
+
+def download_model_if_needed(model_path: str, download_url: Optional[str]) -> bool:
+    """Attempts to download model binary from remote URL if missing."""
+    target = Path(model_path)
+    if target.exists() and target.stat().st_size > 0:
+        return True
+
+    if not download_url:
+        return False
+
     try:
-        # Get prediction from model
-        predictions = model.predict(image_array, verbose=0)
-        
-        # Handle different output shapes
-        if len(predictions) == 0:
-            return "unknown_food"
-        
+        target.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading ML model from {download_url} to {target}...")
+        urllib.request.urlretrieve(download_url, str(target))
+        print(f"ML model successfully downloaded to {target}")
+        return True
+    except Exception as exc:
+        print(f"Warning: Failed to download model from {download_url}: {exc}")
+        return False
+
+
+def load_model_safe(model_path: str = "./models/food_model.h5", download_url: Optional[str] = None):
+    """
+    Safely loads the genuine Keras model.
+    Does NOT fabricate pseudo-AI predictions when the binary is absent.
+    Sets _IS_GENUINE_MODEL=True if successfully loaded.
+    """
+    global _LOADED_MODEL, _IS_GENUINE_MODEL
+    configure_tensorflow_runtime()
+
+    download_model_if_needed(model_path, download_url)
+
+    target = Path(model_path)
+    if target.exists() and target.stat().st_size > 0:
+        try:
+            import tensorflow as tf
+            from tensorflow import keras
+            _LOADED_MODEL = keras.models.load_model(str(target))
+            _IS_GENUINE_MODEL = True
+            print(f"✓ Trained Keras model loaded successfully from {target}")
+            return _LOADED_MODEL
+        except Exception as exc:
+            print(f"Warning: Could not load Keras model at {target}: {exc}")
+
+    _LOADED_MODEL = None
+    _IS_GENUINE_MODEL = False
+    print("ℹ No trained ML model binary found. Food image inference will report 503 Service Unavailable.")
+    return None
+
+
+def get_loaded_model() -> Any:
+    """Returns the globally loaded genuine model, or None if unavailable."""
+    global _LOADED_MODEL
+    return _LOADED_MODEL
+
+
+def is_model_loaded() -> bool:
+    """Returns True if a genuine trained model is loaded."""
+    global _IS_GENUINE_MODEL
+    return _IS_GENUINE_MODEL
+
+
+def set_loaded_model_for_testing(model: Any):
+    """Testing hook to inject an explicit test model or mock without pretending to be a real file."""
+    global _LOADED_MODEL, _IS_GENUINE_MODEL
+    _LOADED_MODEL = model
+    _IS_GENUINE_MODEL = model is not None
+
+
+def predict_food_name(model: Any, image_array: np.ndarray, class_names: Optional[Dict[int, str]] = None) -> str:
+    """
+    Inference pipeline for a loaded Keras or compatible model.
+    """
+    if model is None:
+        raise RuntimeError("No model loaded for prediction")
+
+    try:
+        if hasattr(model, "predict_on_batch"):
+            predictions = model.predict_on_batch(image_array)
+        else:
+            predictions = model.predict(image_array, verbose=0)
+
+        if predictions is None or len(predictions) == 0:
+            raise RuntimeError("Model returned empty prediction output")
+
         pred = predictions[0]
-        
-        # Case 1: Model outputs text/string directly (rare but possible)
+
+        if hasattr(pred, "numpy"):
+            pred = pred.numpy()
+
         if isinstance(pred, (str, bytes)):
             return str(pred)
-        
-        # Case 2: Model outputs probabilities for multiple classes (most common)
-        if len(pred.shape) == 1:
+
+        if len(getattr(pred, "shape", [])) >= 1:
             predicted_class_idx = int(np.argmax(pred))
-            
-            # Try to map to class name
             if class_names and predicted_class_idx in class_names:
                 return class_names[predicted_class_idx]
-            
-            # Fallback: return index-based name
-            return f"food_class_{predicted_class_idx}"
-        
-        # Case 3: Model outputs single value or other format
-        # Try to interpret as index
+            return f"food_item_{predicted_class_idx}"
+
         if isinstance(pred, (int, np.integer)):
             idx = int(pred)
             if class_names and idx in class_names:
                 return class_names[idx]
-            return f"food_class_{idx}"
-        
-        # Fallback: convert prediction to string
-        if hasattr(pred, 'item'):
-            idx = int(np.argmax(pred))
-            if class_names and idx in class_names:
-                return class_names[idx]
-            return f"food_class_{idx}"
-        
-        return "unknown_food"
-    
-    except Exception as e:
-        raise RuntimeError(f"Prediction failed: {str(e)}")
+            return f"food_item_{idx}"
 
-
-# Global class names cache
-_CLASS_NAMES: Optional[Dict[int, str]] = None
-
-
-def get_class_names() -> Optional[Dict[int, str]]:
-    """Get or load class names (cached)"""
-    global _CLASS_NAMES
-    if _CLASS_NAMES is None:
-        _CLASS_NAMES = load_class_names()
-    return _CLASS_NAMES
-
+        raise RuntimeError("Unrecognized model prediction structure")
+    except Exception as exc:
+        raise RuntimeError(f"Model prediction failed: {str(exc)}")

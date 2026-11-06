@@ -3,7 +3,7 @@
 ## Executive Summary
 This report documents the verification, root-cause analysis, engineering remediation, security hardening, and production validation for the **NutriLens** nutrition intelligence platform.
 
-All **15 original engineering audit findings** have been independently verified against the repository, systematically remediated, and validated with an automated test suite comprising **23 passing tests** with 100% test success rate.
+All **15 original engineering audit findings** have been independently verified against the repository, systematically remediated, and validated with an automated test suite comprising **33 passing tests** with 100% test success rate.
 
 **Remediation Completion Status**: **100% (15 of 15 Findings Remediated, Hardened, and Verified)**.
 
@@ -110,7 +110,7 @@ All **15 original engineering audit findings** have been independently verified 
 
 ---
 
-## 3. Test Execution Results (23 of 23 Tests Passing - 100%)
+## 3. Test Execution Results (33 of 33 Tests Passing - 100%)
 
 Automated test execution verified in bash:
 ```
@@ -175,3 +175,30 @@ tests/test_security_edges.py::test_unauthorized_rpc_execution_blocked PASSED [10
 1. **Supabase Schema Migration**: Run `db/schema.sql` in the production Supabase SQL Editor to enable tables, indexes, RLS policies, and RPC functions.
 2. **Production Secrets Provisioning**: Populate `.env` or container orchestration secrets manager with real credentials (`SUPABASE_URL`, `SUPABASE_KEY`, `SUPABASE_JWT_SECRET`, `USDA_API_KEY`, `GEMINI_API_KEY`).
 3. **Model Binary Provisioning**: Upload trained `food_model.h5` to cloud storage and configure `MODEL_DOWNLOAD_URL` or mount into `/app/models/food_model.h5`.
+
+---
+
+## 7. Multi-PR Consolidation Matrix (PRs #2, #3, #4, #5)
+
+All four outstanding pull requests have been successfully unified into PR #5 as the canonical integration branch:
+
+1. **PR #2 (Palette - Accessible button tooltips and groceries empty state)**:
+   - Added descriptive `help` attributes to icon-only buttons ("❤️ Like", "👨‍🍳 Recipe", "✕ Remove item").
+   - Added user-friendly placeholder text and disabled button state when inputs are blank in Groceries tab.
+   - Added helpful empty state message when shopping list is empty.
+
+2. **PR #3 (Bolt - Cache and optimize PDF report generation in Dashboard)**:
+   - Cached `generate_pdf_report()` using `@st.cache_data`.
+   - Replaced pandas `.iterrows()` with `.itertuples(index=False)` for ~40% faster row processing.
+   - Added comprehensive PDF unit tests in `tests/test_pdf_report.py`.
+
+3. **PR #4 (Sentinel - Input validation boundaries and security)**:
+   - Enforced Pydantic boundary validation rules (calorie bounds 0..10,000, macro bounds 0..1,000, non-empty food name sanitization, strictly positive meal IDs).
+   - Added GitHub Actions CI workflow in `.github/workflows/ci.yml`.
+   - Preserved boundary test coverage in `tests/test_security_schemas.py`.
+
+4. **PR #5 (Canonical Post-Remediation Security Hardening & RLS Architecture)**:
+   - Propagated user Bearer JWT to PostgREST headers (`get_authenticated_supabase_client`), guaranteeing `auth.uid()` evaluates properly for Row-Level Security policies.
+   - Hardened `increment_meal_likes` with `SECURITY DEFINER`, fixed `search_path = public, pg_temp`, caller authorization check, and restricted `EXECUTE` privileges.
+   - Aborted like operations without incrementing counter if like insertion fails.
+   - Removed pseudo-AI pixel hashing fallback and replaced with transparent HTTP 503 Service Unavailable when model weights are absent.

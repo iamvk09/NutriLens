@@ -1,6 +1,6 @@
 """
 NutriLens Machine Learning Utilities
-Provides model loading, automated retrieval/fallback, inference optimization,
+Provides model loading, automated retrieval, inference optimization,
 and class mapping for food recognition.
 """
 
@@ -14,13 +14,13 @@ import numpy as np
 # Global references
 _LOADED_MODEL: Any = None
 _CLASS_NAMES: Optional[Dict[int, str]] = None
+_IS_GENUINE_MODEL: bool = False
 
 
 def configure_tensorflow_runtime():
     """Configures TensorFlow memory growth and threading if TensorFlow is present."""
     try:
         import tensorflow as tf
-        # Configure GPU memory growth if GPU is present
         gpus = tf.config.list_physical_devices("GPU")
         if gpus:
             for gpu in gpus:
@@ -28,32 +28,10 @@ def configure_tensorflow_runtime():
                     tf.config.experimental.set_memory_growth(gpu, True)
                 except Exception:
                     pass
-        # Set intra and inter op parallelism threads for predictable CPU consumption
         tf.config.threading.set_inter_op_parallelism_threads(2)
         tf.config.threading.set_intra_op_parallelism_threads(4)
     except Exception:
         pass
-
-
-class LightweightFallbackFoodModel:
-    """
-    In-memory fallback classifier used for CI, automated testing, and development
-    when the 100MB+ binary is not mounted or downloaded.
-    Produces deterministic, food-domain predictions.
-    """
-    def __init__(self, num_classes: int = 101):
-        self.num_classes = num_classes
-
-    def predict(self, image_array: np.ndarray, verbose: int = 0) -> np.ndarray:
-        # Deterministically hash the mean RGB values to a stable class
-        mean_val = float(np.mean(image_array))
-        idx = int(abs(hash(str(round(mean_val, 4))))) % self.num_classes
-        probs = np.zeros((1, self.num_classes), dtype=np.float32)
-        probs[0, idx] = 1.0
-        return probs
-
-    def __call__(self, image_array: np.ndarray) -> np.ndarray:
-        return self.predict(image_array)
 
 
 def load_class_names(class_names_path: Optional[str] = None) -> Optional[Dict[int, str]]:
@@ -84,7 +62,6 @@ def get_class_names() -> Dict[int, str]:
     if _CLASS_NAMES is None:
         _CLASS_NAMES = load_class_names()
     if not _CLASS_NAMES:
-        # Fallback default names for common food classes
         _CLASS_NAMES = {0: "apple", 1: "banana", 2: "pizza", 3: "salad", 4: "sandwich"}
     return _CLASS_NAMES
 
@@ -111,53 +88,67 @@ def download_model_if_needed(model_path: str, download_url: Optional[str]) -> bo
 
 def load_model_safe(model_path: str = "./models/food_model.h5", download_url: Optional[str] = None):
     """
-    Safely loads the Keras model.
-    If the file is not present locally and download fails or is unconfigured,
-    initializes a LightweightFallbackFoodModel to ensure high availability.
+    Safely loads the genuine Keras model.
+    Does NOT fabricate pseudo-AI predictions when the binary is absent.
+    Sets _IS_GENUINE_MODEL=True if successfully loaded.
     """
-    global _LOADED_MODEL
+    global _LOADED_MODEL, _IS_GENUINE_MODEL
     configure_tensorflow_runtime()
 
-    # Try downloading if specified
     download_model_if_needed(model_path, download_url)
 
     target = Path(model_path)
-    if target.exists():
+    if target.exists() and target.stat().st_size > 0:
         try:
             import tensorflow as tf
             from tensorflow import keras
             _LOADED_MODEL = keras.models.load_model(str(target))
+            _IS_GENUINE_MODEL = True
             print(f"✓ Trained Keras model loaded successfully from {target}")
             return _LOADED_MODEL
         except Exception as exc:
             print(f"Warning: Could not load Keras model at {target}: {exc}")
 
-    print("ℹ Using lightweight food classification model for environment availability.")
-    _LOADED_MODEL = LightweightFallbackFoodModel()
-    return _LOADED_MODEL
+    _LOADED_MODEL = None
+    _IS_GENUINE_MODEL = False
+    print("ℹ No trained ML model binary found. Food image inference will report 503 Service Unavailable.")
+    return None
 
 
 def get_loaded_model() -> Any:
-    """Returns the globally loaded model or initializes fallback."""
+    """Returns the globally loaded genuine model, or None if unavailable."""
     global _LOADED_MODEL
-    if _LOADED_MODEL is None:
-        load_model_safe()
     return _LOADED_MODEL
+
+
+def is_model_loaded() -> bool:
+    """Returns True if a genuine trained model is loaded."""
+    global _IS_GENUINE_MODEL
+    return _IS_GENUINE_MODEL
+
+
+def set_loaded_model_for_testing(model: Any):
+    """Testing hook to inject an explicit test model or mock without pretending to be a real file."""
+    global _LOADED_MODEL, _IS_GENUINE_MODEL
+    _LOADED_MODEL = model
+    _IS_GENUINE_MODEL = model is not None
 
 
 def predict_food_name(model: Any, image_array: np.ndarray, class_names: Optional[Dict[int, str]] = None) -> str:
     """
-    Optimized inference pipeline. Accepts preprocessed image and returns food label.
+    Inference pipeline for a loaded Keras or compatible model.
     """
+    if model is None:
+        raise RuntimeError("No model loaded for prediction")
+
     try:
-        # Predict using model
         if hasattr(model, "predict_on_batch"):
             predictions = model.predict_on_batch(image_array)
         else:
             predictions = model.predict(image_array, verbose=0)
 
         if predictions is None or len(predictions) == 0:
-            return "apple"
+            raise RuntimeError("Model returned empty prediction output")
 
         pred = predictions[0]
 
@@ -179,6 +170,6 @@ def predict_food_name(model: Any, image_array: np.ndarray, class_names: Optional
                 return class_names[idx]
             return f"food_item_{idx}"
 
-        return "apple"
+        raise RuntimeError("Unrecognized model prediction structure")
     except Exception as exc:
         raise RuntimeError(f"Model prediction failed: {str(exc)}")

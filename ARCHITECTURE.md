@@ -45,7 +45,7 @@ NutriLens is designed as a decoupled, microservice-ready web application consist
 - **Computer Vision & ML Pipeline (`model_utils.py`)**:
   - Image preprocessing: 224x224 RGB normalization.
   - TensorFlow inference optimization: memory growth configuration and bounded thread pools.
-  - Model retrieval resilience: loads local model, downloads from `MODEL_DOWNLOAD_URL` if configured, or initializes an in-memory deterministic `LightweightFallbackFoodModel` ensuring zero downtime across test and staging environments.
+  - Model retrieval resilience: loads local model, downloads from `MODEL_DOWNLOAD_URL` if configured, and provides transparent error reporting (HTTP 503 Service Unavailable) when the model binary is absent rather than returning pseudo-AI fabricated predictions.
 - **Structured Logging (`logger.py`)**: JSON formatting for production environments, standard formatting for local development, and per-request UUID tracking (`X-Request-ID`).
 
 ### 2.2 Frontend Application (`streamlit_app.py`)

@@ -6,7 +6,7 @@ NutriLens features an automated, async-compatible test suite built with `pytest`
 The test suite covers:
 - **Authentication & RBAC (`tests/test_auth.py`)**: Bearer JWT validation, 401 Unauthorized handling, signature verification, and IDOR prevention blocking cross-user record queries.
 - **API Endpoints (`tests/test_endpoints.py`)**: `/health`, `/api/v1/analyze`, `/api/v1/log_meal`, `/api/v1/history`, `/api/v1/community/feed`, `/api/v1/community/like` (including atomic deduplication 409 Conflict check), `/api/v1/community/leaderboard`, `/api/v1/scan_barcode`, and `/api/v1/scan_label` (Gemini Vision mock).
-- **ML & Validation (`tests/test_model_and_schemas.py`)**: Model fallback inference, class label mapping, and Pydantic boundary checks.
+- **ML & Validation (`tests/test_model_and_schemas.py`, `tests/test_security_edges.py`)**: Model availability handling, class label mapping, model absent (503) verification, and Pydantic boundary checks.
 
 ---
 

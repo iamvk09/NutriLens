@@ -58,23 +58,50 @@ CREATE TABLE IF NOT EXISTS chat_history (
 CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_id, created_at);
 
 -- ==============================================================================
--- ATOMIC RPC FUNCTIONS
+-- HARDENED ATOMIC RPC FUNCTIONS
 -- ==============================================================================
 
 -- Atomic Increment of Likes Count
+-- Enforces:
+-- 1. Caller authentication (auth.uid() must be non-null)
+-- 2. Insertion into meal_likes occurs atomically inside same transaction
+-- 3. Fixed search_path to prevent search_path injection attacks
+-- 4. Restricted EXECUTE privileges
 CREATE OR REPLACE FUNCTION increment_meal_likes(m_id BIGINT)
 RETURNS INTEGER AS $$
 DECLARE
+    calling_user_id TEXT;
     new_count INTEGER;
 BEGIN
-    UPDATE logged_meals
+    calling_user_id := auth.uid()::text;
+    IF calling_user_id IS NULL OR calling_user_id = '' THEN
+        RAISE EXCEPTION 'Unauthorized: Caller must be authenticated to like a meal'
+            USING ERRCODE = '42501';
+    END IF;
+
+    -- Verify meal exists
+    IF NOT EXISTS (SELECT 1 FROM public.logged_meals WHERE id = m_id) THEN
+        RAISE EXCEPTION 'Meal with ID % does not exist', m_id
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    -- Insert like record first; unique constraint enforces single like per user
+    INSERT INTO public.meal_likes (meal_id, user_id)
+    VALUES (m_id, calling_user_id);
+
+    -- Atomically update like counter only after successful like insertion
+    UPDATE public.logged_meals
     SET likes_count = likes_count + 1
     WHERE id = m_id
     RETURNING likes_count INTO new_count;
 
     RETURN new_count;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+
+-- Revoke default public execution & grant strictly to authenticated role
+REVOKE EXECUTE ON FUNCTION increment_meal_likes(BIGINT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION increment_meal_likes(BIGINT) TO authenticated;
 
 -- Database-Side Leaderboard Aggregation for the Last 7 Days
 CREATE OR REPLACE FUNCTION get_top_loggers_last_7_days(limit_count INTEGER DEFAULT 3)
@@ -89,7 +116,7 @@ BEGIN
         SELECT
             m.user_id,
             COUNT(m.id) AS total_meals
-        FROM logged_meals m
+        FROM public.logged_meals m
         WHERE m.created_at >= NOW() - INTERVAL '7 days'
         GROUP BY m.user_id
         ORDER BY total_meals DESC
@@ -101,7 +128,7 @@ BEGIN
         ru.total_meals::BIGINT AS score
     FROM ranked_users ru;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
 -- ==============================================================================
 -- ROW LEVEL SECURITY (RLS) POLICIES

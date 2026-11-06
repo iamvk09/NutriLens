@@ -17,27 +17,25 @@ from PIL import Image
 load_dotenv()
 
 # --- CONFIGURATION: CENTRALIZED URLS & SECRETS ---
+# Safe secrets helper
+def _get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
 # Backend API URL
-if "API_URL" in st.secrets:
-    API_URL = st.secrets["API_URL"].rstrip("/")
-else:
-    API_URL = os.getenv("BACKEND_API_URL", "http://localhost:8000/api/v1").rstrip("/")
+API_URL = (_get_secret("API_URL", os.getenv("BACKEND_API_URL", "http://localhost:8000/api/v1"))).rstrip("/")
 
 # Frontend URL used for OAuth Redirect
-if "APP_URL" in st.secrets:
-    APP_URL = st.secrets["APP_URL"].rstrip("/")
-else:
-    APP_URL = os.getenv("FRONTEND_APP_URL", "http://localhost:8501").rstrip("/")
+APP_URL = (_get_secret("APP_URL", os.getenv("FRONTEND_APP_URL", "http://localhost:8501"))).rstrip("/")
 
 # Supabase and Gemini settings
-try:
-    SUPABASE_URL = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL")
-    SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") or os.getenv("SUPABASE_KEY")
-    GEMINI_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
-except Exception:
-    SUPABASE_URL = os.getenv("SUPABASE_URL")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-    GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+SUPABASE_URL = _get_secret("SUPABASE_URL")
+SUPABASE_KEY = _get_secret("SUPABASE_KEY")
+GEMINI_KEY = _get_secret("GEMINI_API_KEY")
 
 # Page Config
 st.set_page_config(page_title="NutriLens", page_icon="🥗", layout="wide")
@@ -116,8 +114,13 @@ def get_auth_headers() -> Dict[str, str]:
     return headers
 
 
+@st.cache_data
 def generate_pdf_report(user_email: str, dataframe: pd.DataFrame) -> bytes:
-    """Generates user health and meal history PDF report."""
+    """
+    Generates user health and meal history PDF report.
+    Cached via @st.cache_data and optimized with itertuples(index=False)
+    to eliminate redundant rendering and per-row Series construction.
+    """
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 20)
@@ -140,10 +143,11 @@ def generate_pdf_report(user_email: str, dataframe: pd.DataFrame) -> bytes:
         pdf.cell(30, 10, "Cals", 1)
         pdf.ln()
         pdf.set_font("Helvetica", "", 10)
-        for _, row in dataframe.head(20).iterrows():
-            d = str(row.get("Date", ""))
-            f = str(row.get("food_name", ""))[:30]
-            c = str(int(row.get("calories", 0)))
+        top_meals = dataframe.head(20)
+        for row in top_meals.itertuples(index=False):
+            d = str(getattr(row, "Date", ""))
+            f = str(getattr(row, "food_name", ""))[:30]
+            c = str(int(getattr(row, "calories", 0)))
             pdf.cell(40, 10, d, 1)
             pdf.cell(80, 10, f, 1)
             pdf.cell(30, 10, c, 1)
@@ -342,7 +346,7 @@ def main_app():
                             """, unsafe_allow_html=True)
                             b1, b2 = st.columns(2)
                             with b1:
-                                if st.button("❤️ Like", key=f"like_{meal.get('id')}_{idx}"):
+                                if st.button("❤️ Like", key=f"like_{meal.get('id')}_{idx}", help="Like this meal"):
                                     like_res = requests.post(f"{API_URL}/community/like", json={"meal_id": meal.get("id")}, headers=headers, timeout=10)
                                     if like_res.status_code == 200:
                                         st.toast("Liked!")
@@ -352,7 +356,7 @@ def main_app():
                                     else:
                                         st.warning("Could not register like.")
                             with b2:
-                                if st.button("👨‍🍳 Recipe", key=f"rec_{meal.get('id')}_{idx}"):
+                                if st.button("👨‍🍳 Recipe", key=f"rec_{meal.get('id')}_{idx}", help="Cook this recipe in AI Chef"):
                                     st.session_state["last_food"] = meal.get("food_name")
                                     st.toast("Food loaded to AI Chef!")
                 else:
@@ -391,25 +395,28 @@ def main_app():
         st.title("Shopping List")
         c1, c2 = st.columns([3, 1])
         with c1:
-            new_item = st.text_input("Add Groceries Item")
+            new_item = st.text_input("Add Groceries Item", placeholder="e.g., 2 apples, almond milk...")
         with c2:
             st.write("")
             st.write("")
-            if st.button("Add Item") and new_item.strip():
+            if st.button("Add Item", disabled=not (new_item and new_item.strip())) and new_item.strip():
                 if supabase:
                     supabase.table("shopping_list").insert({"user_id": user_id, "item": new_item.strip()}).execute()
                     st.rerun()
 
         if supabase:
             items = supabase.table("shopping_list").select("*").eq("user_id", user_id).execute().data or []
-            for item in items:
-                col_del, col_txt = st.columns([0.1, 0.9])
-                with col_del:
-                    if st.button("✕", key=f"del_{item['id']}"):
-                        supabase.table("shopping_list").delete().eq("id", item["id"]).execute()
-                        st.rerun()
-                with col_txt:
-                    st.write(item["item"])
+            if not items:
+                st.info("🛒 Your shopping list is empty. Add items above or generate them with AI Chef!")
+            else:
+                for item in items:
+                    col_del, col_txt = st.columns([0.1, 0.9])
+                    with col_del:
+                        if st.button("✕", key=f"del_{item['id']}", help="Remove item"):
+                            supabase.table("shopping_list").delete().eq("id", item["id"]).execute()
+                            st.rerun()
+                    with col_txt:
+                        st.write(item["item"])
         else:
             st.info("Shopping list requires configured Supabase connection.")
 

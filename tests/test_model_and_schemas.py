@@ -1,5 +1,5 @@
 """
-Unit tests for model preprocessing, fallback inference, and schema boundary validations.
+Unit tests for model inference utilities and schema boundary validations.
 """
 
 import numpy as np
@@ -7,21 +7,12 @@ import pytest
 from pydantic import ValidationError
 
 from model_utils import (
-    LightweightFallbackFoodModel,
     load_class_names,
     get_class_names,
     predict_food_name,
+    is_model_loaded,
 )
 from schemas import LogMealRequest, LikeRequest, AnalyzeResponse
-
-
-def test_fallback_model_predicts_reliably():
-    """Verifies LightweightFallbackFoodModel returns consistent class probabilities."""
-    model = LightweightFallbackFoodModel(num_classes=101)
-    arr = np.zeros((1, 224, 224, 3), dtype=np.float32)
-    preds = model.predict(arr)
-    assert preds.shape == (1, 101)
-    assert np.isclose(np.sum(preds), 1.0)
 
 
 def test_predict_food_name_with_mapping():
@@ -39,9 +30,15 @@ def test_predict_food_name_with_mapping():
     assert name == "pizza"
 
 
+def test_predict_food_name_none_raises():
+    """Verifies predict_food_name raises error when model is None."""
+    arr = np.zeros((1, 224, 224, 3), dtype=np.float32)
+    with pytest.raises(RuntimeError):
+        predict_food_name(None, arr)
+
+
 def test_log_meal_schema_validation():
     """Tests Pydantic validation rules on meal input fields."""
-    # Valid
     meal = LogMealRequest(
         food_name="Grilled Salmon",
         calories=350.0,
@@ -53,7 +50,6 @@ def test_log_meal_schema_validation():
     assert meal.food_name == "Grilled Salmon"
     assert meal.calories == 350.0
 
-    # Negative calories fail
     with pytest.raises(ValidationError):
         LogMealRequest(
             food_name="Bad Meal",
@@ -63,7 +59,6 @@ def test_log_meal_schema_validation():
             carb_g=1.0
         )
 
-    # Empty food name fails
     with pytest.raises(ValidationError):
         LogMealRequest(
             food_name="   ",
@@ -76,11 +71,9 @@ def test_log_meal_schema_validation():
 
 def test_like_request_schema_validation():
     """Tests meal ID validation on like requests."""
-    # Valid
     like = LikeRequest(meal_id=42)
     assert like.meal_id == 42
 
-    # Negative or zero meal ID fails
     with pytest.raises(ValidationError):
         LikeRequest(meal_id=0)
 
